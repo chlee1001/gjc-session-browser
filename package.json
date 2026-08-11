@@ -9,7 +9,7 @@
     "url": "git+https://github.com/chlee1001/gjc-session-browser.git"
   },
   "scripts": {
-    "dev": "node server.js",
+    "dev": "PORT=${PORT:-4176} node server.js",
     "build": "vite build",
     "start": "NODE_ENV=production node server.js",
     "test": "node --test"

@@ -43,9 +43,9 @@ stop_service() {
   return 1
 }
 
-# 포트를 점유한 프로세스. launchd가 관리하지 않는 프로세스면 그 pid를 돌려준다.
+# 포트를 점유한 프로세스. lsof는 매치가 없으면 1을 돌려주므로 set -e에 걸리지 않게 흡수한다.
 port_holder_pid() {
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
 }
 
 # 해체 직후 남아 있는 리스너는 우리 것이 아니다.

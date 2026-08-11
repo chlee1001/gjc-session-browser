@@ -50,7 +50,7 @@ npm start
 
 `http://127.0.0.1:4175` 을 엽니다.
 
-개발 중에는 Vite 미들웨어가 붙은 모드로 실행합니다.
+개발 중에는 Vite 미들웨어가 붙은 모드로 실행합니다. 상시 서비스와 겹치지 않게 `4176`을 씁니다.
 
 ```bash
 npm run dev
@@ -104,7 +104,7 @@ UI 좌측 **저장소 → 세션 경로 추가** 로 넣은 경로는 `~/.gjc/se
 
 | 환경변수 | 뜻 |
 | --- | --- |
-| `PORT` | 수신 포트 (기본 `4175`) |
+| `PORT` | 수신 포트 (`npm start`·서비스는 `4175`, `npm run dev`는 `4176`) |
 | `GJC_SESSION_DIR` | 세션 폴더 하나 추가 |
 | `GJC_SESSION_DIRS` | 세션 폴더 여러 개 추가 (OS 경로 구분자, POSIX는 `:`) |
 | `GJC_CODING_AGENT_DIR` | GJC 에이전트 디렉터리 (기본 `~/.gjc/agent`) |
