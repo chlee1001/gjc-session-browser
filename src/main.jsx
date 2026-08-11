@@ -1,0 +1,610 @@
+import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { useWindowVirtualizer } from '@tanstack/react-virtual';
+import './styles.css';
+
+const PAGE_SIZE = 50;
+const PALETTE_LIMIT = 8;
+const number = new Intl.NumberFormat('ko-KR');
+const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const relativeTime = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
+
+function formatRelative(iso) {
+  const seconds = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  const ranges = [[60, 'second'], [60, 'minute'], [24, 'hour'], [7, 'day'], [4.345, 'week'], [12, 'month'], [Infinity, 'year']];
+  let value = seconds;
+  for (const [divisor, unit] of ranges) {
+    if (Math.abs(value) < divisor) return relativeTime.format(Math.round(value), unit);
+    value /= divisor;
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function splitModel(model) {
+  if (!model) return { vendor: '', name: '' };
+  const separator = model.lastIndexOf('/');
+  if (separator === -1) return { vendor: '', name: model };
+  return { vendor: model.slice(0, separator), name: model.slice(separator + 1) };
+}
+
+/** Keep Tab cycling inside one dialog panel. */
+function trapTabFocus(event, panel) {
+  if (event.key !== 'Tab' || !panel) return;
+  const focusable = [...panel.querySelectorAll('input, button:not(:disabled)')];
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+/** Freeze background scrolling while a dialog is open; returns the restore callback. */
+function lockBodyScroll() {
+  const previousOverflow = document.body.style.overflow;
+  document.body.style.overflow = 'hidden';
+  return () => { document.body.style.overflow = previousOverflow; };
+}
+
+function SessionRow({ session, onOpen, onToggleFocus }) {
+  const model = splitModel(session.model);
+  return (
+    <article className={session.focused ? 'session-row is-focused' : 'session-row'} id={`session-${session.id}`}>
+      <button className="session-open" type="button" onClick={() => onOpen(session)} aria-label={`${session.title} 상세 정보 열기`}>
+        <div className="session-main">
+          <div className="session-code" aria-hidden="true">{session.folderName.slice(0, 2).toUpperCase()}</div>
+          <div className="session-copy">
+            <div className="session-title-line">
+              <h2>{session.title}</h2>
+              <span className="session-id">{session.id.slice(0, 8)}</span>
+            </div>
+            {session.preview ? <p>{session.preview}</p> : null}
+            <span className="session-path" title={session.cwd}>{session.cwd || '작업 폴더 정보 없음'}</span>
+          </div>
+        </div>
+        <dl className="session-metrics">
+          <div><dt>최근 활동</dt><dd title={new Date(session.lastActivity).toLocaleString('ko-KR')}>{formatRelative(session.lastActivity)}</dd></div>
+          <div><dt>메시지</dt><dd>{number.format(session.messageCount)}</dd></div>
+          <div><dt>토큰</dt><dd>{session.totalTokens ? number.format(session.totalTokens) : '—'}</dd></div>
+          <div><dt>비용</dt><dd>{session.cost ? money.format(session.cost) : '—'}</dd></div>
+          <div><dt>파일</dt><dd>{formatBytes(session.size)}</dd></div>
+        </dl>
+        <div className="session-model" title={session.model || undefined}>
+          <span>{model.vendor || '모델'}</span>
+          <strong>{model.name || '정보 없음'}</strong>
+        </div>
+      </button>
+      <button
+        className="session-focus"
+        type="button"
+        aria-pressed={session.focused}
+        aria-label={session.focused ? `${session.title} 작업 중 표시 해제` : `${session.title} 작업 중으로 표시`}
+        onClick={() => onToggleFocus(session.id, !session.focused)}
+      >
+        {session.focused ? '작업 중' : '추가'}
+      </button>
+    </article>
+  );
+}
+
+function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiveIndex, onClose, onSelect, inputRef }) {
+  const panelRef = useRef(null);
+
+  if (!open) return null;
+  return (
+    <div className="command-layer" onKeyDown={(event) => trapTabFocus(event, panelRef.current)}>
+      <button className="command-backdrop" type="button" onClick={onClose} aria-label="검색 닫기" />
+      <section className="command-panel" id="command-palette" ref={panelRef} role="dialog" aria-modal="true" aria-labelledby="command-title">
+        <h2 id="command-title" className="sr-only">세션 빠른 검색</h2>
+        <div className="command-input">
+          <span aria-hidden="true">⌕</span>
+          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목, 대화, 경로, 모델 검색" aria-controls="command-results" />
+          <kbd>ESC</kbd>
+        </div>
+        <div className="command-results" id="command-results">
+          <div className="command-caption"><span>{query ? '검색 결과' : '최근 세션'}</span><strong>{number.format(sessions.length)}</strong></div>
+          {sessions.length ? sessions.map((session, index) => (
+            <button key={session.id} type="button" className={index === activeIndex ? 'command-item is-active' : 'command-item'} onMouseEnter={() => setActiveIndex(index)} onClick={() => onSelect(session)}>
+              <span>{session.title}</span>
+              <small>{session.folderName} · {formatRelative(session.lastActivity)}</small>
+            </button>
+          )) : <p className="command-empty">일치하는 세션이 없습니다.</p>}
+        </div>
+        <footer className="command-hints"><span><kbd>↑</kbd><kbd>↓</kbd> 이동</span><span><kbd>↵</kbd> 선택</span><span><kbd>ESC</kbd> 닫기</span></footer>
+      </section>
+    </div>
+  );
+}
+
+function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onToggleFocus }) {
+  const [copied, setCopied] = useState(false);
+  const [title, setTitle] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [focusSaving, setFocusSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [mutationError, setMutationError] = useState('');
+  const closeRef = useRef(null);
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    if (!selected) return undefined;
+    setTitle(selected.title);
+    setCopied(false);
+    setConfirmingDelete(false);
+    setFocusSaving(false);
+    setMutationError('');
+    const restoreScroll = lockBodyScroll();
+    closeRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      restoreScroll();
+    };
+  }, [selected, onClose]);
+
+  if (!selected) return null;
+  const session = detail || selected;
+
+  const copyId = async () => {
+    await navigator.clipboard.writeText(session.id);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1400);
+  };
+
+  const rename = async (event) => {
+    event.preventDefault();
+    const nextTitle = title.trim();
+    if (!nextTitle || nextTitle === session.title) return;
+    setSaving(true);
+    setMutationError('');
+    try {
+      await onRename(session.id, nextTitle);
+    } catch (renameError) {
+      setMutationError(renameError.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async () => {
+    setDeleting(true);
+    setMutationError('');
+    try {
+      await onDelete(session.id);
+    } catch (deleteError) {
+      setMutationError(deleteError.message);
+      setDeleting(false);
+    }
+  };
+
+  const toggleFocus = async () => {
+    setFocusSaving(true);
+    setMutationError('');
+    try {
+      await onToggleFocus(session.id, !session.focused);
+    } catch (focusError) {
+      setMutationError(focusError.message);
+    } finally {
+      setFocusSaving(false);
+    }
+  };
+
+
+  return (
+    <div className="detail-layer">
+      <button className="detail-backdrop" type="button" onClick={onClose} aria-label="상세 정보 닫기" />
+      <section className="detail-panel" ref={panelRef} onKeyDown={(event) => trapTabFocus(event, panelRef.current)} role="dialog" aria-modal="true" aria-labelledby="detail-title">
+        <header className="detail-heading">
+          <div><span>SESSION DETAIL</span><h2 id="detail-title">{session.title}</h2></div>
+          <button ref={closeRef} className="detail-close" type="button" onClick={onClose} aria-label="상세 정보 닫기">×</button>
+        </header>
+
+        {loading ? <div className="detail-state">세션 원본을 읽고 있습니다.</div> : null}
+        {error ? <div className="detail-state is-error">{error}</div> : null}
+        {!loading && !error && detail ? (
+          <div className="detail-content">
+            <button className="detail-focus-toggle" type="button" aria-pressed={session.focused} onClick={toggleFocus} disabled={focusSaving || deleting}>
+              {focusSaving ? '저장 중' : session.focused ? '작업 중에서 제거' : '작업 중으로 표시'}
+            </button>
+            <form className="rename-form" onSubmit={rename}>
+              <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled} /></label>
+              <button type="submit" disabled={saving || deleting || mutationDisabled || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
+            </form>
+
+            <dl className="detail-grid">
+              <div><dt>세션 ID</dt><dd><code>{session.id}</code><button type="button" onClick={copyId} data-state={copied ? 'success' : undefined}>{copied ? '복사됨' : '복사'}</button></dd></div>
+              <div><dt>작업 폴더</dt><dd><code>{session.cwd || '—'}</code></dd></div>
+              <div><dt>세션 파일</dt><dd><code>{session.filePath}</code></dd></div>
+              <div><dt>모델</dt><dd><code>{session.model || '—'}</code></dd></div>
+              <div><dt>시작</dt><dd>{new Date(session.startedAt).toLocaleString('ko-KR')}</dd></div>
+              <div><dt>최근 활동</dt><dd>{new Date(session.lastActivity).toLocaleString('ko-KR')}</dd></div>
+              <div><dt>메시지</dt><dd>{number.format(session.messageCount)}</dd></div>
+              <div><dt>토큰 · 비용</dt><dd>{number.format(session.totalTokens)} · {money.format(session.cost)}</dd></div>
+            </dl>
+
+            <section className="exchange">
+              <h3>마지막 대화</h3>
+              {detail.lastExchange?.user ? <div className="exchange-message"><span>USER</span><p>{detail.lastExchange.user.text}</p></div> : null}
+              {detail.lastExchange?.assistant ? <div className="exchange-message is-assistant"><span>ASSISTANT</span><p>{detail.lastExchange.assistant.text}</p></div> : null}
+              {!detail.lastExchange ? <p className="exchange-empty">텍스트 대화가 없습니다.</p> : null}
+            </section>
+
+            <section className="danger-zone">
+              <div><h3>세션 삭제</h3><p>세션 기록과 연결된 아티팩트를 영구 삭제합니다.</p></div>
+              {!confirmingDelete ? (
+                <button type="button" onClick={() => setConfirmingDelete(true)} disabled={mutationDisabled}>삭제</button>
+              ) : (
+                <div className="delete-confirm">
+                  <p>삭제 후 복구할 수 없습니다. 이 세션만 삭제합니다.</p>
+                  <button type="button" onClick={() => setConfirmingDelete(false)} disabled={deleting}>취소</button>
+                  <button className="confirm-delete" type="button" onClick={remove} disabled={deleting}>{deleting ? '삭제 중' : '영구 삭제'}</button>
+                </div>
+              )}
+            </section>
+
+            {mutationDisabled ? <p className="mutation-message">인덱싱이 끝나면 제목 변경과 삭제를 사용할 수 있습니다.</p> : null}
+            {mutationError ? <p className="mutation-message is-error" role="alert">{mutationError}</p> : null}
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function App() {
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const [folder, setFolder] = useState('');
+  const [focusOnly, setFocusOnly] = useState(false);
+  const [sessions, setSessions] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [resultCount, setResultCount] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextOffset, setNextOffset] = useState(0);
+  const [error, setError] = useState('');
+  const [requestKey, setRequestKey] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [directory, setDirectory] = useState('');
+  const [directoryError, setDirectoryError] = useState('');
+  const [addingDirectory, setAddingDirectory] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const forceRefresh = useRef(false);
+  const loadingMoreRef = useRef(false);
+  const searchTriggerRef = useRef(null);
+  const paletteInputRef = useRef(null);
+  const listRef = useRef(null);
+  const detailRequestRef = useRef(null);
+  const listGenerationRef = useRef(0);
+
+  const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
+    const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', offset: String(offset), limit: String(PAGE_SIZE) });
+    if (force) params.set('refresh', '1');
+    const response = await fetch(`/api/sessions?${params}`, { signal });
+    if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
+    const result = await response.json();
+    if (generation !== listGenerationRef.current) return;
+    setSummary(result.summary);
+    setResultCount(result.resultCount);
+    setHasMore(result.hasMore);
+    setNextOffset(result.nextOffset);
+    setSessions((current) => {
+      if (!append) return result.sessions;
+      const existing = new Set(current.map((session) => session.id));
+      return [...current, ...result.sessions.filter((session) => !existing.has(session.id))];
+    });
+  }, [deferredQuery, folder, focusOnly]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const generation = ++listGenerationRef.current;
+    const force = forceRefresh.current;
+    forceRefresh.current = false;
+    setLoading(true);
+    setSessions([]);
+    setError('');
+    fetchPage(0, { force, signal: controller.signal, generation })
+      .catch((fetchError) => {
+        if (fetchError.name !== 'AbortError') setError(fetchError.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [fetchPage, requestKey]);
+
+  useEffect(() => {
+    if (!summary?.indexing) return undefined;
+    const timer = setTimeout(async () => {
+      const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', summaryOnly: '1' });
+      try {
+        const result = await (await fetch(`/api/sessions?${params}`)).json();
+        setSummary(result.summary);
+        setResultCount(result.resultCount);
+      } catch {
+        // The next list request will recover the status.
+      }
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [summary, deferredQuery, folder, focusOnly]);
+
+  const loadMore = useCallback(async () => {
+    if (!hasMore || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      await fetchPage(nextOffset, { append: true, generation: listGenerationRef.current });
+    } catch (fetchError) {
+      setError(fetchError.message);
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [fetchPage, hasMore, nextOffset]);
+
+  const rowVirtualizer = useWindowVirtualizer({
+    count: sessions.length,
+    estimateSize: () => 132,
+    getItemKey: (index) => sessions[index]?.id ?? index,
+    overscan: 8,
+    scrollMargin: listRef.current?.offsetTop ?? 0,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+
+  useEffect(() => {
+    const last = virtualRows.at(-1);
+    if (last && last.index >= sessions.length - 8) void loadMore();
+  }, [virtualRows, sessions.length, loadMore]);
+
+  const closePalette = () => {
+    setPaletteOpen(false);
+    requestAnimationFrame(() => searchTriggerRef.current?.focus());
+  };
+
+  const openDetail = useCallback(async (session) => {
+    setPaletteOpen(false);
+    setSelected(session);
+    setDetail(null);
+    setDetailError('');
+    setDetailLoading(true);
+    detailRequestRef.current?.abort();
+    const controller = new AbortController();
+    detailRequestRef.current = controller;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, { signal: controller.signal });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '상세 정보를 불러오지 못했습니다.');
+      setDetail(result);
+    } catch (detailFetchError) {
+      if (detailFetchError.name !== 'AbortError') setDetailError(detailFetchError.message);
+    } finally {
+      if (!controller.signal.aborted) setDetailLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!paletteOpen) return undefined;
+    const restoreScroll = lockBodyScroll();
+    setActiveIndex(0);
+    paletteInputRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setPaletteOpen(false);
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setActiveIndex((index) => Math.min(index + 1, Math.min(sessions.length || 1, PALETTE_LIMIT) - 1));
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setActiveIndex((index) => Math.max(index - 1, 0));
+      }
+      if (event.key === 'Enter' && sessions[activeIndex]) {
+        event.preventDefault();
+        openDetail(sessions[activeIndex]);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      restoreScroll();
+    };
+  }, [paletteOpen, activeIndex, sessions, openDetail]);
+
+  useEffect(() => {
+    const onShortcut = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setPaletteOpen(true);
+      }
+    };
+    document.addEventListener('keydown', onShortcut);
+    return () => document.removeEventListener('keydown', onShortcut);
+  }, []);
+
+  const closeDetail = useCallback(() => {
+    detailRequestRef.current?.abort();
+    setSelected(null);
+    setDetail(null);
+  }, []);
+
+  const applySessionUpdate = useCallback((sessionId, updated) => {
+    setSessions((current) => current.map((session) => session.id === sessionId ? updated : session));
+    setSelected((current) => current?.id === sessionId ? { ...current, ...updated } : current);
+    setDetail((current) => current?.id === sessionId ? { ...current, ...updated } : current);
+  }, []);
+
+  const dropSession = useCallback((sessionId) => {
+    setSessions((current) => current.filter((session) => session.id !== sessionId));
+    setResultCount((current) => Math.max(0, current - 1));
+    closeDetail();
+  }, [closeDetail]);
+
+  const renameSession = useCallback(async (sessionId, title) => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '세션 제목을 변경하지 못했습니다.');
+
+    applySessionUpdate(sessionId, result.session);
+    setSummary(result.summary);
+    return result.session;
+  }, [applySessionUpdate]);
+
+  const deleteSession = useCallback(async (sessionId) => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: sessionId }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '세션을 삭제하지 못했습니다.');
+
+    dropSession(sessionId);
+    setSummary(result.summary);
+  }, [dropSession]);
+
+  const toggleFocus = useCallback(async (sessionId, focused) => {
+    const response = await fetch(`/api/focus/${encodeURIComponent(sessionId)}`, { method: focused ? 'PUT' : 'DELETE' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '작업 중 상태를 변경하지 못했습니다.');
+
+    if (focusOnly && !focused) dropSession(sessionId);
+    else applySessionUpdate(sessionId, result.session);
+    setSummary(result.summary);
+  }, [focusOnly, applySessionUpdate, dropSession]);
+
+  const refresh = () => {
+    forceRefresh.current = true;
+    setRequestKey((key) => key + 1);
+  };
+
+  const addDirectory = async (event) => {
+    event.preventDefault();
+    if (!directory.trim()) return;
+    setAddingDirectory(true);
+    setDirectoryError('');
+    try {
+      const response = await fetch('/api/directories', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: directory }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '폴더를 추가하지 못했습니다.');
+      setDirectory('');
+      setRequestKey((key) => key + 1);
+    } catch (addError) {
+      setDirectoryError(addError.message);
+    } finally {
+      setAddingDirectory(false);
+    }
+  };
+
+  const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
+  const sessionDirectories = summary?.sessionDirectories || [];
+  const paletteSessions = sessions.slice(0, 8);
+
+  return (
+    <div className="app-shell">
+      <nav className="topbar" aria-label="주요 탐색">
+        <a className="wordmark" href="#top" aria-label="GJC Sessions 처음으로"><span>GJC</span> / SESSIONS</a>
+        <button className="search-trigger" type="button" ref={searchTriggerRef} onClick={() => setPaletteOpen(true)} aria-expanded={paletteOpen} aria-controls="command-palette">
+          <span aria-hidden="true">⌕</span><span>{query || '세션 검색'}</span><kbd>⌘ K</kbd>
+        </button>
+        <div className="topbar-actions">
+          <span className={summary?.indexing ? 'system-status is-busy' : 'system-status'}><i /> {summary?.indexing ? `인덱싱 ${progress}%` : 'INDEX READY'}</span>
+          <button className="refresh-button" type="button" onClick={refresh} disabled={loading} aria-busy={loading}>{loading ? '확인 중' : '다시 스캔'}</button>
+        </div>
+      </nav>
+
+      <main id="top">
+        <header className="index-header">
+          <div><p>로컬 작업 기록</p><h1>세션 인덱스</h1></div>
+          <p className="index-intro">작업 폴더마다 흩어진 GJC 세션을 제목, 대화 내용, 모델과 경로로 찾습니다.</p>
+        </header>
+
+        <section className="readout" aria-label="세션 통계">
+          <div><span>세션</span><strong>{summary ? number.format(summary.sessionCount) : '—'}</strong></div>
+          <div><span>작업 폴더</span><strong>{summary ? number.format(summary.folderCount) : '—'}</strong></div>
+          <div><span>메시지</span><strong>{summary ? number.format(summary.totalMessages) : '—'}</strong></div>
+          <div><span>토큰</span><strong>{summary?.totalTokens ? number.format(summary.totalTokens) : '—'}</strong></div>
+          <div><span>비용</span><strong>{summary?.totalCost ? money.format(summary.totalCost) : '—'}</strong></div>
+        </section>
+
+        {summary?.indexing ? <div className="index-progress" role="status"><span style={{ width: `${progress}%` }} /><p>목록 사용 가능 · 대화 검색 인덱스 {number.format(summary.indexedCount)}/{number.format(summary.totalCount)}</p></div> : null}
+
+        <div className="workspace">
+          <aside className="filters">
+            <section>
+              <h2>범위</h2>
+              <button className="focus-filter" type="button" aria-pressed={focusOnly} onClick={() => setFocusOnly((current) => !current)}>
+                <span>작업 중</span><strong>{number.format(summary?.focusedCount || 0)}</strong>
+              </button>
+              <label>
+                <span>작업 폴더</span>
+                <span className="select-shell">
+                  <select value={folder} onChange={(event) => setFolder(event.target.value)}>
+                    <option value="">모든 작업 폴더</option>
+                    {summary?.folders.map((item) => <option key={item.cwd} value={item.cwd}>{item.name} · {item.count}</option>)}
+                  </select>
+                </span>
+              </label>
+              {query ? <button className="clear-filter" type="button" onClick={() => setQuery('')}>검색어 “{query}” 지우기</button> : null}
+            </section>
+            <section>
+              <h2>저장소</h2>
+              <ul className="repository-list">{sessionDirectories.map((item) => <li key={item} title={item}>{item}</li>)}</ul>
+              <form className="directory-form" onSubmit={addDirectory}>
+                <label><span>세션 경로 추가</span><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="~/work/gjc-sessions" aria-invalid={Boolean(directoryError)} aria-describedby="directory-message" /></label>
+                <button type="submit" disabled={addingDirectory || !directory.trim()}>{addingDirectory ? '경로 확인 중' : '경로 추가'}</button>
+                <p id="directory-message" className={directoryError ? 'is-error' : undefined} role={directoryError ? 'alert' : undefined}>{directoryError || 'JSONL 세션이 저장된 폴더를 입력하세요.'}</p>
+              </form>
+            </section>
+          </aside>
+
+          <section className="session-index" aria-live="polite" aria-busy={loading}>
+            <header className="results-heading"><div><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>최근 활동순</span></header>
+            {error ? <div className="empty-state is-error">{error}</div> : null}
+            {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
+            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{focusOnly ? '작업 중으로 표시한 세션이 없습니다.' : '검색 조건에 맞는 세션이 없습니다.'}</div> : null}
+            <div ref={listRef} className="virtual-list" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
+              {virtualRows.map((virtualRow) => {
+                const session = sessions[virtualRow.index];
+                return (
+                  <div key={virtualRow.key} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} className="virtual-row" style={{ transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)` }}>
+                    <SessionRow session={session} onOpen={openDetail} onToggleFocus={toggleFocus} />
+                  </div>
+                );
+              })}
+            </div>
+            {loadingMore ? <div className="load-more" role="status">다음 세션을 불러오는 중</div> : null}
+            {!hasMore && sessions.length > 0 ? <div className="list-end">{number.format(resultCount)}개 세션을 모두 불러왔습니다.</div> : null}
+          </section>
+        </div>
+      </main>
+
+      <footer className="page-footer"><span>LOCAL ONLY</span><span>{sessionDirectories.length}개 저장소</span><span>{summary?.scannedAt ? `마지막 확인 ${formatRelative(summary.scannedAt)}` : '저장소 확인 중'}</span></footer>
+
+      <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={activeIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
+      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onToggleFocus={toggleFocus} />
+    </div>
+  );
+}
+
+createRoot(document.getElementById('root')).render(<App />);
