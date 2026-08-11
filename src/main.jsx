@@ -5,6 +5,16 @@ import './styles.css';
 
 const PAGE_SIZE = 50;
 const PALETTE_LIMIT = 8;
+const DEFAULT_PERIOD = '7d';
+const PERIODS = [
+  { value: '1d', label: '오늘' },
+  { value: '3d', label: '최근 3일' },
+  { value: '7d', label: '최근 1주' },
+  { value: '30d', label: '최근 1개월' },
+  { value: '90d', label: '최근 3개월' },
+  { value: 'all', label: '전체 기간' },
+  { value: 'custom', label: '직접 지정' },
+];
 const number = new Intl.NumberFormat('ko-KR');
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 const relativeTime = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
@@ -30,6 +40,31 @@ function splitModel(model) {
   const separator = model.lastIndexOf('/');
   if (separator === -1) return { vendor: '', name: model };
   return { vendor: model.slice(0, separator), name: model.slice(separator + 1) };
+}
+
+// 날짜 문자열을 로컬 하루 경계로 바꾼다. new Date('2026-08-01')은 UTC 자정이라
+// UTC보다 뒤진 시간대에서 하루가 밀린다. 연·월·일을 직접 넘겨 그 함정을 피한다.
+function localDayBound(dateString, endOfDay) {
+  const [year, month, day] = dateString.split('-').map(Number);
+  return endOfDay
+    ? new Date(year, month - 1, day, 23, 59, 59, 999)
+    : new Date(year, month - 1, day, 0, 0, 0, 0);
+}
+
+/** 선택한 기간을 서버가 문자열로 비교할 수 있는 UTC ISO 구간으로 바꾼다. */
+function periodRange(period, customFrom, customTo) {
+  if (period === 'all') return { from: '', to: '' };
+  if (period === 'custom') {
+    return {
+      from: customFrom ? localDayBound(customFrom, false).toISOString() : '',
+      to: customTo ? localDayBound(customTo, true).toISOString() : '',
+    };
+  }
+  const days = Number(period.replace('d', ''));
+  const from = new Date();
+  from.setHours(0, 0, 0, 0);
+  from.setDate(from.getDate() - (days - 1));
+  return { from: from.toISOString(), to: '' };
 }
 
 /** Keep Tab cycling inside one dialog panel. */
@@ -290,6 +325,9 @@ function App() {
   const deferredQuery = useDeferredValue(query);
   const [folder, setFolder] = useState('');
   const [focusOnly, setFocusOnly] = useState(false);
+  const [period, setPeriod] = useState(DEFAULT_PERIOD);
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
   const [sessions, setSessions] = useState([]);
   const [summary, setSummary] = useState(null);
   const [resultCount, setResultCount] = useState(0);
@@ -318,7 +356,8 @@ function App() {
   const listGenerationRef = useRef(0);
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
-    const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', offset: String(offset), limit: String(PAGE_SIZE) });
+    const { from, to } = periodRange(period, customFrom, customTo);
+    const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', from, to, offset: String(offset), limit: String(PAGE_SIZE) });
     if (force) params.set('refresh', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
     if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
@@ -333,7 +372,7 @@ function App() {
       const existing = new Set(current.map((session) => session.id));
       return [...current, ...result.sessions.filter((session) => !existing.has(session.id))];
     });
-  }, [deferredQuery, folder, focusOnly]);
+  }, [deferredQuery, folder, focusOnly, period, customFrom, customTo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -356,7 +395,8 @@ function App() {
   useEffect(() => {
     if (!summary?.indexing) return undefined;
     const timer = setTimeout(async () => {
-      const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', summaryOnly: '1' });
+      const { from, to } = periodRange(period, customFrom, customTo);
+      const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', from, to, summaryOnly: '1' });
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
         setSummary(result.summary);
@@ -366,7 +406,7 @@ function App() {
       }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [summary, deferredQuery, folder, focusOnly]);
+  }, [summary, deferredQuery, folder, focusOnly, period, customFrom, customTo]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current) return;
@@ -566,6 +606,11 @@ function App() {
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
   const dialogOpen = paletteOpen || Boolean(selected);
+  const scopeLabel = focusOnly
+    ? '작업 중'
+    : period === 'custom'
+      ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
+      : PERIODS.find((item) => item.value === period).label;
 
   return (
     <div className="app-shell">
@@ -606,6 +651,27 @@ function App() {
                 <span>작업 중</span><strong>{number.format(summary?.focusedCount || 0)}</strong>
               </button>
               <label>
+                <span>기간</span>
+                <span className="select-shell">
+                  <select value={period} onChange={(event) => setPeriod(event.target.value)} disabled={focusOnly}>
+                    {PERIODS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                  </select>
+                </span>
+              </label>
+              {period === 'custom' && !focusOnly ? (
+                <div className="date-range">
+                  <label>
+                    <span>시작</span>
+                    <input type="date" value={customFrom} max={customTo || undefined} onChange={(event) => setCustomFrom(event.target.value)} />
+                  </label>
+                  <label>
+                    <span>종료</span>
+                    <input type="date" value={customTo} min={customFrom || undefined} onChange={(event) => setCustomTo(event.target.value)} />
+                  </label>
+                </div>
+              ) : null}
+              {focusOnly ? <p className="scope-note">작업 중 목록은 기간과 무관하게 모두 보여줍니다.</p> : null}
+              <label>
                 <span>작업 폴더</span>
                 <span className="select-shell">
                   <select value={folder} onChange={(event) => setFolder(event.target.value)}>
@@ -628,10 +694,10 @@ function App() {
           </aside>
 
           <section className="session-index" aria-busy={loading}>
-            <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>최근 활동순</span></header>
+            <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>{scopeLabel} · 최근 활동순</span></header>
             {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
-            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{focusOnly ? '작업 중으로 표시한 세션이 없습니다.' : '검색 조건에 맞는 세션이 없습니다.'}</div> : null}
+            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{focusOnly ? '작업 중으로 표시한 세션이 없습니다.' : `${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
             <div ref={listRef} className="virtual-list" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
               {virtualRows.map((virtualRow) => {
                 const session = sessions[virtualRow.index];

@@ -231,10 +231,16 @@ export async function indexSessionFiles(files, onSession) {
   }, INDEX_CONCURRENCY);
 }
 
-export function filterSessions(sessions, query = '', folder = '') {
+/**
+ * `from`·`to`는 UTC ISO 인스턴트다. 호출부가 로컬 하루 경계를 계산해 넘기므로
+ * 여기서는 문자열 비교만 한다. lastActivity도 같은 형식이라 사전순 비교가 곧 시각 비교다.
+ */
+export function filterSessions(sessions, { query = '', folder = '', from = '', to = '' } = {}) {
   const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return sessions.filter((session) => {
     if (folder && session.cwd !== folder) return false;
+    if (from && session.lastActivity < from) return false;
+    if (to && session.lastActivity > to) return false;
     return terms.every((term) => session.searchText.includes(term));
   });
 }

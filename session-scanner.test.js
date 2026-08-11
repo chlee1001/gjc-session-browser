@@ -48,10 +48,10 @@ test('중첩 폴더를 스캔하고 여러 검색어와 폴더를 함께 필터�
   try {
     const sessions = await indexAll([directory]);
     assert.equal(sessions.length, 1);
-    assert.equal(filterSessions(sessions, '검색어 gpt-test').length, 1);
-    assert.equal(filterSessions(sessions, '없는말').length, 0);
-    assert.equal(filterSessions(sessions, '', '/work/alpha').length, 1);
-    assert.equal(filterSessions(sessions, '', '/work/other').length, 0);
+    assert.equal(filterSessions(sessions, { query: '검색어 gpt-test' }).length, 1);
+    assert.equal(filterSessions(sessions, { query: '없는말' }).length, 0);
+    assert.equal(filterSessions(sessions, { folder: '/work/alpha' }).length, 1);
+    assert.equal(filterSessions(sessions, { folder: '/work/other' }).length, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -117,4 +117,21 @@ test('header_patch로 변경된 제목을 목록과 상세 조회에 반영한�
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('기간 구간으로 세션을 걸러낸다', () => {
+  const sessions = [
+    { lastActivity: '2026-08-01T10:00:00.000Z', cwd: '', searchText: 'a' },
+    { lastActivity: '2026-08-05T10:00:00.000Z', cwd: '', searchText: 'b' },
+    { lastActivity: '2026-08-09T10:00:00.000Z', cwd: '', searchText: 'c' },
+  ];
+
+  assert.equal(filterSessions(sessions, { from: '2026-08-04T00:00:00.000Z' }).length, 2);
+  assert.equal(filterSessions(sessions, { to: '2026-08-04T00:00:00.000Z' }).length, 1);
+  assert.equal(
+    filterSessions(sessions, { from: '2026-08-02T00:00:00.000Z', to: '2026-08-08T00:00:00.000Z' }).length,
+    1,
+  );
+  assert.equal(filterSessions(sessions, {}).length, 3);
+  assert.equal(filterSessions(sessions, { from: '2026-08-05T10:00:00.000Z' }).length, 2, '경계는 포함이다');
 });

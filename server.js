@@ -171,9 +171,17 @@ function sendJson(response, statusCode, value) {
   response.end(JSON.stringify(value));
 }
 
+// 북마크 수는 기간과 무관하게 전체 인덱스 기준이어야 사이드바 숫자가 맞는다.
+function focusedSessionCount() {
+  let count = 0;
+  for (const session of sessionMap.values()) {
+    if (focusedSessionIds.has(session.id)) count += 1;
+  }
+  return count;
+}
+
 function getSummary(sessions) {
   const folders = new Map();
-  let focusedCount = 0;
   let totalMessages = 0;
   let totalTokens = 0;
   let totalCost = 0;
@@ -182,13 +190,12 @@ function getSummary(sessions) {
     totalMessages += session.messageCount;
     totalTokens += session.totalTokens;
     totalCost += session.cost;
-    if (focusedSessionIds.has(session.id)) focusedCount += 1;
     if (session.cwd) folders.set(session.cwd, (folders.get(session.cwd) || 0) + 1);
   }
 
   return {
     sessionCount: sessions.length,
-    focusedCount,
+    focusedCount: focusedSessionCount(),
     folderCount: folders.size,
     totalMessages,
     totalTokens,
@@ -446,11 +453,17 @@ async function handleApi(request, response) {
     const focusOnly = url.searchParams.get('focus') === '1';
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 100);
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
-    const filtered = filterSessions(focusOnly ? allSessions.filter((session) => focusedSessionIds.has(session.id)) : allSessions, query, folder);
+    const from = url.searchParams.get('from') || '';
+    const to = url.searchParams.get('to') || '';
+    // 작업 중 목록은 기간을 무시한다. 북마크가 기간 밖으로 밀려 사라지면 기능이 무의미해진다.
+    const scoped = focusOnly
+      ? allSessions.filter((session) => focusedSessionIds.has(session.id))
+      : filterSessions(allSessions, { from, to });
+    const filtered = filterSessions(scoped, { query, folder });
     const summaryOnly = url.searchParams.get('summaryOnly') === '1';
     const page = summaryOnly ? [] : filtered.slice(offset, offset + limit);
     sendJson(response, 200, {
-      summary: getSummary(allSessions),
+      summary: getSummary(scoped),
       resultCount: filtered.length,
       offset,
       nextOffset: offset + page.length,

@@ -61,6 +61,10 @@ main, .page-footer { width: min(90rem, calc(100% - 3rem)); margin-inline: auto; 
 .select-shell::after { content: ''; position: absolute; top: 50%; right: var(--space-sm); translate: 0 -50%; width: .5rem; height: .3125rem; background: var(--color-muted); clip-path: polygon(0 0, 100% 0, 50% 100%); pointer-events: none; }
 .filters select:active, .directory-form input:active { border-color: var(--color-accent); }
 .clear-filter { overflow: hidden; width: 100%; min-height: 2.75rem; border: 0; padding: 0; color: var(--color-accent); background: transparent; font-size: var(--text-sm); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.date-range { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+.date-range input { width: 100%; min-height: 2.75rem; border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-sm); padding: 0 var(--space-sm); color: var(--color-ink); background: var(--color-paper); font: var(--text-xs)/1 var(--font-mono); }
+.date-range input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .5; }
+.scope-note { margin: 0; color: var(--color-muted); font-size: var(--text-xs); line-height: 1.45; }
 .focus-filter { display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); min-height: 2.75rem; border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-sm); padding: 0 var(--space-sm); color: var(--color-body); background: var(--color-paper); font-size: var(--text-sm); }
 .focus-filter strong { color: var(--color-muted); font: 500 var(--text-xs)/1 var(--font-mono); }
 .focus-filter[aria-pressed='true'] { border-color: var(--color-accent); color: var(--color-accent); background: var(--color-accent-soft); }
