@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import './styles.css';
@@ -55,7 +55,7 @@ function lockBodyScroll() {
   return () => { document.body.style.overflow = previousOverflow; };
 }
 
-function SessionRow({ session, onOpen, onToggleFocus }) {
+const SessionRow = memo(function SessionRow({ session, onOpen, onToggleFocus }) {
   const model = splitModel(session.model);
   return (
     <article className={session.focused ? 'session-row is-focused' : 'session-row'} id={`session-${session.id}`}>
@@ -94,7 +94,7 @@ function SessionRow({ session, onOpen, onToggleFocus }) {
       </button>
     </article>
   );
-}
+});
 
 function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiveIndex, onClose, onSelect, inputRef }) {
   const panelRef = useRef(null);
@@ -293,6 +293,7 @@ function App() {
   const paletteInputRef = useRef(null);
   const listRef = useRef(null);
   const detailRequestRef = useRef(null);
+  const detailTriggerRef = useRef(null);
   const listGenerationRef = useRef(0);
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
@@ -360,12 +361,25 @@ function App() {
     }
   }, [fetchPage, hasMore, nextOffset]);
 
+  // 목록 시작 위치는 렌더가 아니라 레이아웃 이후에 잰다. 렌더 중 offsetTop 읽기는 매번 강제 리플로를 부른다.
+  const [listOffset, setListOffset] = useState(0);
+
+  useLayoutEffect(() => {
+    const node = listRef.current;
+    if (!node) return undefined;
+    const measure = () => setListOffset((current) => (node.offsetTop === current ? current : node.offsetTop));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(document.body);
+    return () => observer.disconnect();
+  }, []);
+
   const rowVirtualizer = useWindowVirtualizer({
     count: sessions.length,
     estimateSize: () => 132,
     getItemKey: (index) => sessions[index]?.id ?? index,
     overscan: 8,
-    scrollMargin: listRef.current?.offsetTop ?? 0,
+    scrollMargin: listOffset,
   });
   const virtualRows = rowVirtualizer.getVirtualItems();
 
@@ -374,12 +388,14 @@ function App() {
     if (last && last.index >= sessions.length - 8) void loadMore();
   }, [virtualRows, sessions.length, loadMore]);
 
-  const closePalette = () => {
+  const closePalette = useCallback(() => {
     setPaletteOpen(false);
+    // inert 해제가 커밋된 뒤에 포커스를 돌려준다.
     requestAnimationFrame(() => searchTriggerRef.current?.focus());
-  };
+  }, []);
 
   const openDetail = useCallback(async (session) => {
+    detailTriggerRef.current = document.activeElement;
     setPaletteOpen(false);
     setSelected(session);
     setDetail(null);
@@ -406,7 +422,7 @@ function App() {
     setActiveIndex(0);
     paletteInputRef.current?.focus();
     const onKeyDown = (event) => {
-      if (event.key === 'Escape') setPaletteOpen(false);
+      if (event.key === 'Escape') closePalette();
       if (event.key === 'ArrowDown') {
         event.preventDefault();
         setActiveIndex((index) => Math.min(index + 1, Math.min(sessions.length || 1, PALETTE_LIMIT) - 1));
@@ -425,7 +441,7 @@ function App() {
       document.removeEventListener('keydown', onKeyDown);
       restoreScroll();
     };
-  }, [paletteOpen, activeIndex, sessions, openDetail]);
+  }, [paletteOpen, activeIndex, sessions, openDetail, closePalette]);
 
   useEffect(() => {
     const onShortcut = (event) => {
@@ -442,6 +458,10 @@ function App() {
     detailRequestRef.current?.abort();
     setSelected(null);
     setDetail(null);
+    const trigger = detailTriggerRef.current;
+    detailTriggerRef.current = null;
+    // 삭제로 닫힌 경우 원래 행은 사라졌으므로 복귀 대상이 없다.
+    if (trigger?.isConnected) requestAnimationFrame(() => trigger.focus());
   }, []);
 
   const applySessionUpdate = useCallback((sessionId, updated) => {
@@ -518,10 +538,13 @@ function App() {
 
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
-  const paletteSessions = sessions.slice(0, 8);
+  const paletteSessions = sessions.slice(0, PALETTE_LIMIT);
+  const dialogOpen = paletteOpen || Boolean(selected);
 
   return (
     <div className="app-shell">
+      {/* 모달이 열리면 배경을 inert로 잠근다. aria-modal만으로는 스크린리더가 배경에 닿는 경우가 있다. */}
+      <div inert={dialogOpen || undefined}>
       <nav className="topbar" aria-label="주요 탐색">
         <a className="wordmark" href="#top" aria-label="GJC Sessions 처음으로"><span>GJC</span> / SESSIONS</a>
         <button className="search-trigger" type="button" ref={searchTriggerRef} onClick={() => setPaletteOpen(true)} aria-expanded={paletteOpen} aria-controls="command-palette">
@@ -578,9 +601,9 @@ function App() {
             </section>
           </aside>
 
-          <section className="session-index" aria-live="polite" aria-busy={loading}>
-            <header className="results-heading"><div><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>최근 활동순</span></header>
-            {error ? <div className="empty-state is-error">{error}</div> : null}
+          <section className="session-index" aria-busy={loading}>
+            <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>최근 활동순</span></header>
+            {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
             {!error && !loading && sessions.length === 0 ? <div className="empty-state">{focusOnly ? '작업 중으로 표시한 세션이 없습니다.' : '검색 조건에 맞는 세션이 없습니다.'}</div> : null}
             <div ref={listRef} className="virtual-list" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
@@ -600,6 +623,7 @@ function App() {
       </main>
 
       <footer className="page-footer"><span>LOCAL ONLY</span><span>{sessionDirectories.length}개 저장소</span><span>{summary?.scannedAt ? `마지막 확인 ${formatRelative(summary.scannedAt)}` : '저장소 확인 중'}</span></footer>
+      </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={activeIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
       <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onToggleFocus={toggleFocus} />
