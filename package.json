@@ -1,0 +1,23 @@
+{
+  "name": "gjc-session-browser",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chlee1001/gjc-session-browser.git"
+  },
+  "scripts": {
+    "dev": "node server.js",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.14.9",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  }
+}

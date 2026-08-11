@@ -1,0 +1,20 @@
+# 의존성과 빌드 산출물
+node_modules/
+dist/
+
+# 로컬 AI 도구 설정 — 이 프로젝트의 코드가 아니다
+.agents/
+.claude/
+.gjc/
+.hallmark/
+skills-lock.json
+
+# 비밀값
+.env
+.env.*
+
+# 로그
+*.log
+
+# macOS
+.DS_Store
