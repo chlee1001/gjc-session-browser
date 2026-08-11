@@ -43,6 +43,20 @@ stop_service() {
   return 1
 }
 
+# 포트를 점유한 프로세스. launchd가 관리하지 않는 프로세스면 그 pid를 돌려준다.
+port_holder_pid() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+# 해체 직후 남아 있는 리스너는 우리 것이 아니다.
+assert_port_free() {
+  local holder
+  holder="$(port_holder_pid)"
+  [ -z "$holder" ] && return 0
+  die "포트 $PORT 를 다른 프로세스가 쓰고 있습니다 (pid $holder: $(ps -o command= -p "$holder" 2>/dev/null | head -1)).
+그 프로세스를 먼저 끄거나 GJC_SESSION_LIST_PORT 로 다른 포트를 지정하세요."
+}
+
 responds() {
   curl -fsS -o /dev/null --max-time 3 "$URL/api/sessions?limit=1" 2>/dev/null
 }
@@ -119,6 +133,7 @@ cmd_install() {
   build
   write_plist
   stop_service || die "기존 서비스를 해체하지 못했습니다."
+  assert_port_free
   launchctl bootstrap "$DOMAIN" "$PLIST"
   if wait_until_responds; then
     printf '%s\n' "등록 완료. 로그인할 때마다 자동 실행합니다: $URL"
@@ -133,6 +148,7 @@ cmd_start() {
   if is_registered; then
     launchctl kickstart "$DOMAIN/$LABEL" 2>/dev/null || true
   else
+    assert_port_free
     launchctl bootstrap "$DOMAIN" "$PLIST"
   fi
   if wait_until_responds; then
@@ -160,6 +176,7 @@ cmd_update() {
   build
   write_plist
   stop_service || die "기존 서비스를 해체하지 못했습니다."
+  assert_port_free
   launchctl bootstrap "$DOMAIN" "$PLIST"
   if wait_until_responds; then
     printf '%s\n' "새 빌드로 재시작했습니다: $URL"
@@ -176,7 +193,7 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local pid node_bin
+  local pid node_bin holder
   printf '%-12s %s\n' "레이블" "$LABEL"
   printf '%-12s %s\n' "주소" "$URL"
   printf '%-12s %s\n' "plist" "$([ -f "$PLIST" ] && echo "$PLIST" || echo '없음 (자동 시작 안 함)')"
@@ -196,6 +213,11 @@ cmd_status() {
     printf '%-12s %s\n' "응답" "정상"
   else
     printf '%-12s %s\n' "응답" "없음"
+  fi
+
+  holder="$(port_holder_pid)"
+  if [ -n "$holder" ] && [ "$holder" != "$(service_pid)" ]; then
+    printf '%-12s %s\n' "경고" "포트 $PORT 를 launchd 밖의 프로세스가 점유 중 (pid $holder)"
   fi
 
   if [ -f "$PLIST" ]; then
