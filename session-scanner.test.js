@@ -135,3 +135,24 @@ test('기간 구간으로 세션을 걸러낸다', () => {
   assert.equal(filterSessions(sessions, {}).length, 3);
   assert.equal(filterSessions(sessions, { from: '2026-08-05T10:00:00.000Z' }).length, 2, '경계는 포함이다');
 });
+
+test('세션 파일과 같은 이름의 아티팩트 디렉터리는 탐색에서 제외한다', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'gjc-artifacts-'));
+  const scope = path.join(directory, 'v2-scope');
+  const sessionName = '2026-08-10T01-00-00-000Z_session-123';
+  const artifacts = path.join(scope, sessionName);
+  await mkdir(artifacts, { recursive: true });
+  await writeFile(path.join(scope, `${sessionName}.jsonl`), entries.map(JSON.stringify).join('\n'));
+  // 서브에이전트 트랜스크립트. 독립 세션처럼 보이지만 목록에 들어가면 안 된다.
+  await writeFile(path.join(artifacts, '0-Planner.jsonl'), entries.map(JSON.stringify).join('\n'));
+  await mkdir(path.join(artifacts, '1-Architect'), { recursive: true });
+  await writeFile(path.join(artifacts, '1-Architect', 'deep.jsonl'), entries.map(JSON.stringify).join('\n'));
+
+  try {
+    const { sessions } = await discoverSessions([directory]);
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].filePath, path.join(scope, `${sessionName}.jsonl`));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

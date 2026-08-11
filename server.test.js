@@ -29,16 +29,17 @@ async function waitForServer(baseUrl) {
 
 test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', { timeout: 45_000 }, async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'gjc-session-api-'));
-  const sessionDirectory = path.join(home, 'sessions');
   const agentDirectory = path.join(home, 'agent');
+  // 기본 관리 저장소 경로에 둬야 삭제가 GJC 관리 경로를 탄다.
+  // 별도 폴더에 두면 FileSessionStorage 분기만 검증돼 관리 경로 회귀를 놓친다.
+  const sessionDirectory = path.join(agentDirectory, 'sessions', 'v2-scope');
   const sessionFile = path.join(sessionDirectory, 'session.jsonl');
   const sessionId = '9d51d5d8-861c-4c03-9938-c78f75c62e37';
   const entries = [
     { type: 'session', version: 4, id: sessionId, timestamp: '2026-08-10T01:00:00.000Z', cwd: home, title: '변경 전 제목' },
     { type: 'message', id: 'c5307ea4-1e48-4bf7-a2a7-9da1be2762ee', parentId: null, timestamp: '2026-08-10T01:01:00.000Z', message: { role: 'user', content: [{ type: 'text', text: '통합 테스트' }] } },
   ];
-  await mkdir(sessionDirectory, { recursive: true });
-  await mkdir(agentDirectory, { recursive: true });
+  await mkdir(path.join(sessionDirectory, 'session'), { recursive: true });
   await writeFile(sessionFile, `${entries.map(JSON.stringify).join('\n')}\n`);
 
   const port = await availablePort();
@@ -50,7 +51,6 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
       NODE_ENV: 'production',
       PORT: String(port),
       GJC_CODING_AGENT_DIR: agentDirectory,
-      GJC_SESSION_DIR: sessionDirectory,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -114,6 +114,8 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
     assert.equal(deleteResponse.status, 200, deleted.error || diagnostics);
     assert.equal(deleted.deleted, sessionId);
     await assert.rejects(access(sessionFile));
+    // 세션 파일과 동명 디렉터리는 그 세션의 아티팩트 폴더다. 함께 사라져야 한다.
+    await assert.rejects(access(path.join(sessionDirectory, 'session')));
     const config = JSON.parse(await readFile(path.join(home, '.gjc', 'session-list.json'), 'utf8'));
     assert.deepEqual(config.focusedSessionIds, []);
   } finally {

@@ -24,6 +24,21 @@ async function mapConcurrent(items, worker, concurrency) {
   return results;
 }
 
+/**
+ * GJC는 세션 파일 `<name>.jsonl` 옆에 같은 이름의 디렉터리를 만들어 그 세션의
+ * 아티팩트와 서브에이전트 트랜스크립트를 담는다. 그 안의 .jsonl은 독립 세션이
+ * 아니므로 트리째 건너뛴다. 넣으면 목록이 서브에이전트 기록으로 뒤덮이고,
+ * 삭제도 실패한다 — GJC의 관리 세션 삭제는 `<저장소>/<폴더>/<파일>` 배치를 전제한다.
+ */
+async function isArtifactDirectory(directoryPath) {
+  try {
+    const sibling = await stat(`${directoryPath}.jsonl`);
+    return sibling.isFile();
+  } catch {
+    return false;
+  }
+}
+
 async function findSessionFiles(directories) {
   const files = [];
   const pending = directories.filter(Boolean);
@@ -40,8 +55,11 @@ async function findSessionFiles(directories) {
 
     for (const entry of entries) {
       const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) pending.push(fullPath);
-      else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(fullPath);
+      if (entry.isDirectory()) {
+        if (!await isArtifactDirectory(fullPath)) pending.push(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        files.push(fullPath);
+      }
     }
   }
 

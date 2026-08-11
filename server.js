@@ -256,13 +256,21 @@ function gjcModuleUrl(packageDirectory, moduleName) {
   return pathToFileURL(path.join(packageDirectory, 'src', 'session', moduleName)).href;
 }
 
-/** Run one Bun script against the installed GJC session modules. Inputs travel as env, never as source text. */
+/**
+ * Run one Bun script against the installed GJC session modules. Inputs travel as env, never as source text.
+ * 실패하면 스크립트 본문이 통째로 담긴 셸 오류 대신 GJC가 던진 문장만 남긴다.
+ */
 async function runGjcScript(script, env) {
-  await runFile('bun', ['-e', script], {
-    timeout: 30_000,
-    maxBuffer: 1024 * 1024,
-    env: { ...process.env, ...env },
-  });
+  try {
+    await runFile('bun', ['-e', script], {
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, ...env },
+    });
+  } catch (error) {
+    const reason = /^\s*(?:\[Uncaught Exception\]\s*)?(?:\w*Error): (.+)$/m.exec(error.stderr || '');
+    throw new Error(reason ? reason[1].trim() : 'GJC 세션 작업이 실패했습니다.');
+  }
 }
 
 async function renameStoredSession(session, title) {
@@ -301,12 +309,27 @@ async function deleteStoredSession(session) {
     const target = process.env.GJC_DELETE_TARGET;
     const root = process.env.GJC_DELETE_ROOT;
     const defaultRoot = process.env.GJC_DEFAULT_SESSION_ROOT;
-    if (root === defaultRoot) {
-      const { SessionManager } = await import(process.env.GJC_MANAGER_URL);
-      await SessionManager.deleteManagedCandidate(target);
-    } else {
-      const { FileSessionStorage } = await import(process.env.GJC_STORAGE_URL);
+    const { FileSessionStorage } = await import(process.env.GJC_STORAGE_URL);
+    if (root !== defaultRoot) {
       await new FileSessionStorage().deleteSessionWithArtifacts(target);
+    } else {
+      const { SessionManager } = await import(process.env.GJC_MANAGER_URL);
+      // GJC가 이 파일에 대한 관리 권한을 세우지 못하는 경우다. 작업 폴더가 사라졌거나
+      // 관리 후보 목록에 없을 때인데, 지킬 관리 상태가 없으므로 전사본과 아티팩트만
+      // 지운다. 삭제 범위는 그 세션 파일과 동명 디렉터리로 한정된다.
+      // 그 외 실패(마이그레이션 잠금, 입출력)는 그대로 올린다.
+      const AUTHORITY_REFUSALS = [
+        'Could not resolve managed session scope',
+        'Session is not an authorized managed candidate',
+        'Managed session scan did not grant deletion authority',
+      ];
+      try {
+        await SessionManager.deleteManagedCandidate(target);
+      } catch (error) {
+        const message = String(error?.message ?? '');
+        if (!AUTHORITY_REFUSALS.some((refusal) => message.includes(refusal))) throw error;
+        await new FileSessionStorage().deleteSessionWithArtifacts(target);
+      }
     }
   `;
   await runGjcScript(script, {
