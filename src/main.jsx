@@ -1,4 +1,4 @@
-import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import './styles.css';
@@ -98,6 +98,20 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onToggleFocus }) 
 
 function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiveIndex, onClose, onSelect, inputRef }) {
   const panelRef = useRef(null);
+  const activeItemRef = useRef(null);
+  const resultsRef = useRef(null);
+  // 마우스 hover로 바뀐 선택까지 스크롤하면 커서 아래에서 목록이 튄다. 키보드 이동만 따라간다.
+  const skipScrollRef = useRef(false);
+
+  useEffect(() => {
+    if (skipScrollRef.current) {
+      skipScrollRef.current = false;
+      return;
+    }
+    // 첫 항목에서는 캡션까지 보이도록 맨 위로 붙인다.
+    if (activeIndex === 0) resultsRef.current?.scrollTo({ top: 0 });
+    else activeItemRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex, open]);
 
   if (!open) return null;
   return (
@@ -110,10 +124,17 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
           <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목, 대화, 경로, 모델 검색" aria-controls="command-results" />
           <kbd>ESC</kbd>
         </div>
-        <div className="command-results" id="command-results">
+        <div className="command-results" id="command-results" ref={resultsRef}>
           <div className="command-caption"><span>{query ? '검색 결과' : '최근 세션'}</span><strong>{number.format(sessions.length)}</strong></div>
           {sessions.length ? sessions.map((session, index) => (
-            <button key={session.id} type="button" className={index === activeIndex ? 'command-item is-active' : 'command-item'} onMouseEnter={() => setActiveIndex(index)} onClick={() => onSelect(session)}>
+            <button
+              key={session.id}
+              ref={index === activeIndex ? activeItemRef : null}
+              type="button"
+              className={index === activeIndex ? 'command-item is-active' : 'command-item'}
+              onMouseEnter={() => { skipScrollRef.current = true; setActiveIndex(index); }}
+              onClick={() => onSelect(session)}
+            >
               <span>{session.title}</span>
               <small>{session.folderName} · {formatRelative(session.lastActivity)}</small>
             </button>
@@ -416,32 +437,38 @@ function App() {
     }
   }, []);
 
+  const paletteSessions = useMemo(() => sessions.slice(0, PALETTE_LIMIT), [sessions]);
+  // 검색 결과가 줄어 선택이 범위를 벗어나면 하이라이트가 사라진다. 효과가 아니라 렌더에서 보정한다.
+  const paletteActiveIndex = Math.min(activeIndex, Math.max(paletteSessions.length - 1, 0));
+
+  // 열림 수명주기. activeIndex를 의존성에 두면 화살표로 옮긴 선택이 곧바로 0으로 되돌아간다.
   useEffect(() => {
     if (!paletteOpen) return undefined;
-    const restoreScroll = lockBodyScroll();
     setActiveIndex(0);
     paletteInputRef.current?.focus();
+    return lockBodyScroll();
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    if (!paletteOpen) return undefined;
     const onKeyDown = (event) => {
       if (event.key === 'Escape') closePalette();
       if (event.key === 'ArrowDown') {
         event.preventDefault();
-        setActiveIndex((index) => Math.min(index + 1, Math.min(sessions.length || 1, PALETTE_LIMIT) - 1));
+        setActiveIndex((index) => Math.min(index + 1, Math.max(paletteSessions.length - 1, 0)));
       }
       if (event.key === 'ArrowUp') {
         event.preventDefault();
         setActiveIndex((index) => Math.max(index - 1, 0));
       }
-      if (event.key === 'Enter' && sessions[activeIndex]) {
+      if (event.key === 'Enter' && paletteSessions[paletteActiveIndex]) {
         event.preventDefault();
-        openDetail(sessions[activeIndex]);
+        openDetail(paletteSessions[paletteActiveIndex]);
       }
     };
     document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('keydown', onKeyDown);
-      restoreScroll();
-    };
-  }, [paletteOpen, activeIndex, sessions, openDetail, closePalette]);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [paletteOpen, paletteSessions, paletteActiveIndex, openDetail, closePalette]);
 
   useEffect(() => {
     const onShortcut = (event) => {
@@ -538,7 +565,6 @@ function App() {
 
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
-  const paletteSessions = sessions.slice(0, PALETTE_LIMIT);
   const dialogOpen = paletteOpen || Boolean(selected);
 
   return (
@@ -625,7 +651,7 @@ function App() {
       <footer className="page-footer"><span>LOCAL ONLY</span><span>{sessionDirectories.length}개 저장소</span><span>{summary?.scannedAt ? `마지막 확인 ${formatRelative(summary.scannedAt)}` : '저장소 확인 중'}</span></footer>
       </div>
 
-      <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={activeIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
+      <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
       <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onToggleFocus={toggleFocus} />
     </div>
   );
