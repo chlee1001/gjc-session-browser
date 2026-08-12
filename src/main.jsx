@@ -71,6 +71,8 @@ const STATUSES = [
   { value: 'active', label: '작업 중' },
   { value: 'done', label: '완료' },
 ];
+// 필터에는 "표시 없음"까지 고를 수 있어야 "완료만 빼고 보기"가 된다.
+const STATUS_FACETS = [{ value: 'none', label: '표시 없음' }, ...STATUSES];
 
 /** 받침 유무에 따라 조사를 고른다. "완료으로"같은 틀린 표기를 막는다. */
 function withParticle(word, afterConsonant, afterVowel) {
@@ -166,7 +168,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
               type="button"
               aria-pressed={on}
               aria-label={on ? `${session.title} ${item.label} 표시 해제` : `${session.title} ${withParticle(item.label, '으로', '로')} 표시`}
-              onClick={() => onSetStatus(session.id, on ? 'none' : item.value)}
+              onClick={() => onSetStatus(session.id, on ? 'none' : item.value, session.status)}
             >
               {item.label}
             </button>
@@ -284,11 +286,11 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     }
   };
 
-  const changeStatus = async (next) => {
+  const changeStatus = async (next, previous) => {
     setStatusSaving(true);
     setMutationError('');
     try {
-      await onSetStatus(session.id, next);
+      await onSetStatus(session.id, next, previous);
     } catch (statusError) {
       setMutationError(statusError.message);
     } finally {
@@ -319,7 +321,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
                     className={`session-mark is-${item.value}`}
                     type="button"
                     aria-pressed={on}
-                    onClick={() => changeStatus(on ? 'none' : item.value)}
+                    onClick={() => changeStatus(on ? 'none' : item.value, session.status)}
                     disabled={statusSaving || deleting}
                   >
                     {item.label}
@@ -376,9 +378,8 @@ function App() {
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [folder, setFolder] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
-  // 사이드바 숫자는 기간과 무관하게 전체 기준이라 요약과 별도로 든다.
-  const [statusCounts, setStatusCounts] = useState({ active: 0, done: 0 });
+  const [statusFilters, setStatusFilters] = useState([]);
+  const [statusCounts, setStatusCounts] = useState({ none: 0, active: 0, done: 0 });
   const [period, setPeriod] = useState(DEFAULT_PERIOD);
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
@@ -411,7 +412,7 @@ function App() {
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
     const { from, to } = periodRange(period, customFrom, customTo);
-    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilter, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), from, to, offset: String(offset), limit: String(PAGE_SIZE) });
     if (force) params.set('refresh', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
     if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
@@ -427,7 +428,7 @@ function App() {
       const existing = new Set(current.map((session) => session.id));
       return [...current, ...result.sessions.filter((session) => !existing.has(session.id))];
     });
-  }, [deferredQuery, folder, statusFilter, period, customFrom, customTo]);
+  }, [deferredQuery, folder, statusFilters, period, customFrom, customTo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -451,7 +452,7 @@ function App() {
     if (!summary?.indexing) return undefined;
     const timer = setTimeout(async () => {
       const { from, to } = periodRange(period, customFrom, customTo);
-      const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilter, from, to, summaryOnly: '1' });
+      const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), from, to, summaryOnly: '1' });
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
         setSummary(result.summary);
@@ -462,7 +463,7 @@ function App() {
       }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [summary, deferredQuery, folder, statusFilter, period, customFrom, customTo]);
+  }, [summary, deferredQuery, folder, statusFilters, period, customFrom, customTo]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current) return;
@@ -622,12 +623,11 @@ function App() {
     if (!response.ok) throw new Error(result.error || '세션을 삭제하지 못했습니다.');
 
     dropSession(sessionId);
-    setStatusCounts(result.statusCounts);
-    // 통계는 기간에 맞춰져 있으므로 서버가 다시 계산해야 맞는다.
+    // 통계와 상태 숫자는 서버가 현재 조건으로 다시 계산해야 맞는다.
     setRequestKey((key) => key + 1);
   }, [dropSession]);
 
-  const setSessionStatus = useCallback(async (sessionId, next) => {
+  const setSessionStatus = useCallback(async (sessionId, next, previous) => {
     const response = await fetch(`/api/status/${encodeURIComponent(sessionId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -636,11 +636,15 @@ function App() {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '상태를 변경하지 못했습니다.');
 
-    // 상태로 걸러보는 중이라면 그 상태를 벗어난 세션은 목록에서 빠진다.
-    if (statusFilter && result.session.status !== statusFilter) dropSession(sessionId);
+    // 걸러보는 상태 밖으로 나가면 목록에서 빠진다.
+    if (statusFilters.length && !statusFilters.includes(result.session.status)) dropSession(sessionId);
     else applySessionUpdate(sessionId, result.session);
-    setStatusCounts(result.statusCounts);
-  }, [statusFilter, applySessionUpdate, dropSession]);
+    setStatusCounts((current) => ({
+      ...current,
+      [previous]: Math.max(0, current[previous] - 1),
+      [next]: current[next] + 1,
+    }));
+  }, [statusFilters, applySessionUpdate, dropSession]);
 
   const refresh = () => {
     forceRefresh.current = true;
@@ -668,11 +672,12 @@ function App() {
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
   const dialogOpen = paletteOpen || Boolean(selected);
-  const scopeLabel = statusFilter
-    ? STATUSES.find((item) => item.value === statusFilter).label
-    : period === 'custom'
-      ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
-      : PERIODS.find((item) => item.value === period).label;
+  const periodLabel = period === 'custom'
+    ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
+    : PERIODS.find((item) => item.value === period).label;
+  const scopeLabel = statusFilters.length
+    ? `${periodLabel} · ${statusFilters.map((value) => STATUS_FACETS.find((item) => item.value === value).label).join(', ')}`
+    : periodLabel;
 
   return (
     <div className="app-shell">
@@ -710,27 +715,30 @@ function App() {
             <section>
               <h2>범위</h2>
               <div className="status-filters" role="group" aria-label="상태로 걸러보기">
-                {STATUSES.map((item) => (
+                {STATUS_FACETS.map((item) => (
                   <button
                     key={item.value}
                     className={`status-filter is-${item.value}`}
                     type="button"
-                    aria-pressed={statusFilter === item.value}
-                    onClick={() => setStatusFilter((current) => (current === item.value ? '' : item.value))}
+                    aria-pressed={statusFilters.includes(item.value)}
+                    onClick={() => setStatusFilters((current) => (
+                      current.includes(item.value) ? current.filter((value) => value !== item.value) : [...current, item.value]
+                    ))}
                   >
                     <span>{item.label}</span><strong>{number.format(statusCounts[item.value])}</strong>
                   </button>
                 ))}
               </div>
+              <p className="scope-note">{statusFilters.length ? '고른 상태만 보입니다.' : '상태를 고르지 않으면 전부 보입니다.'}</p>
               <label>
                 <span>기간</span>
                 <span className="select-shell">
-                  <select value={period} onChange={(event) => setPeriod(event.target.value)} disabled={Boolean(statusFilter)}>
+                  <select value={period} onChange={(event) => setPeriod(event.target.value)}>
                     {PERIODS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   </select>
                 </span>
               </label>
-              {period === 'custom' && !statusFilter ? (
+              {period === 'custom' ? (
                 <div className="date-range">
                   <label>
                     <span>시작</span>
@@ -742,7 +750,7 @@ function App() {
                   </label>
                 </div>
               ) : null}
-              {statusFilter ? <p className="scope-note">상태로 걸러볼 때는 기간과 무관하게 모두 보여줍니다.</p> : null}
+
               <label>
                 <span>작업 폴더</span>
                 <span className="select-shell">
@@ -769,7 +777,7 @@ function App() {
             <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>{scopeLabel} · 최근 활동순</span></header>
             {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
-            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{statusFilter ? `${withParticle(scopeLabel, '으로', '로')} 표시한 세션이 없습니다.` : `${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
+            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{`${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
             <div ref={listRef} className="virtual-list" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
               {virtualRows.map((virtualRow) => {
                 const session = sessions[virtualRow.index];

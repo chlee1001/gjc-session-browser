@@ -70,6 +70,7 @@ main, .page-footer { width: min(90rem, calc(100% - 3rem)); margin-inline: auto; 
 .status-filters { display: grid; gap: var(--space-sm); }
 .status-filter { display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); min-height: 2.75rem; border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-sm); padding: 0 var(--space-sm); color: var(--color-body); background: var(--color-paper); font-size: var(--text-sm); }
 .status-filter strong { color: var(--color-muted); font: 500 var(--text-xs)/1 var(--font-mono); }
+.status-filter.is-none[aria-pressed='true'] { border-color: var(--color-ink); color: var(--color-ink); background: var(--color-paper-2); }
 .status-filter.is-active[aria-pressed='true'] { border-color: var(--color-accent); color: var(--color-accent); background: var(--color-accent-soft); }
 .status-filter.is-done[aria-pressed='true'] { border-color: var(--color-success); color: var(--color-success); background: var(--color-success-soft); }
 .status-filter[aria-pressed='true'] strong { color: inherit; }

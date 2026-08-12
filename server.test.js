@@ -77,22 +77,28 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
       return { response, body: await response.json() };
     };
 
+    const listWith = async (query) => (await (await fetch(`${baseUrl}/api/sessions?${query}`)).json());
+
     const active = await setStatus('active');
     assert.equal(active.response.status, 200, active.body.error || diagnostics);
     assert.equal(active.body.session.status, 'active');
-    assert.deepEqual(active.body.statusCounts, { active: 1, done: 0 });
-    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=active`)).json()).resultCount, 1);
+    assert.equal((await listWith('status=active')).resultCount, 1);
+    assert.deepEqual((await listWith('')).summary.statusCounts, { none: 0, active: 1, done: 0 });
 
     // 작업 중과 완료는 배타적이다. 완료로 바꾸면 작업 중에서 빠져야 한다.
     const done = await setStatus('done');
     assert.equal(done.body.session.status, 'done');
-    assert.deepEqual(done.body.statusCounts, { active: 0, done: 1 });
-    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=active`)).json()).resultCount, 0);
-    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=done`)).json()).resultCount, 1);
+    assert.equal((await listWith('status=active')).resultCount, 0);
+    assert.equal((await listWith('status=done')).resultCount, 1);
+
+    // 여러 상태를 함께 고를 수 있어야 "완료만 빼고 보기"가 된다.
+    assert.equal((await listWith('status=none,active')).resultCount, 0, '완료는 제외된다');
+    assert.equal((await listWith('status=none,done')).resultCount, 1);
+    assert.equal((await listWith('status=')).resultCount, 1, '고르지 않으면 전부 보인다');
 
     const cleared = await setStatus('none');
     assert.equal(cleared.body.session.status, 'none');
-    assert.deepEqual(cleared.body.statusCounts, { active: 0, done: 0 });
+    assert.equal((await listWith('status=none,active')).resultCount, 1);
 
     const rejected = await setStatus('bogus');
     assert.equal(rejected.response.status, 400);

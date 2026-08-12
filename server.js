@@ -21,6 +21,7 @@ const decompress = promisify(gunzip);
 const runFile = promisify(execFileCallback);
 
 let customDirectories = [];
+const STATUS_VALUES = ['none', 'active', 'done'];
 let sessionStatus = new Map();
 let sessionMap = new Map();
 let initialized = false;
@@ -181,15 +182,6 @@ function sendJson(response, statusCode, value) {
   response.end(JSON.stringify(value));
 }
 
-// 상태 수는 기간과 무관하게 전체 인덱스 기준이어야 사이드바 숫자가 맞는다.
-function statusCounts() {
-  const counts = { active: 0, done: 0 };
-  for (const session of sessionMap.values()) {
-    const value = sessionStatus.get(session.id);
-    if (value === 'active' || value === 'done') counts[value] += 1;
-  }
-  return counts;
-}
 
 function getSummary(sessions) {
   const folders = new Map();
@@ -206,7 +198,6 @@ function getSummary(sessions) {
 
   return {
     sessionCount: sessions.length,
-    statusCounts: statusCounts(),
     folderCount: folders.size,
     totalMessages,
     totalTokens,
@@ -388,7 +379,7 @@ async function handleApi(request, response) {
         return true;
       }
       const body = await readBody(request);
-      if (!['active', 'done', 'none'].includes(body.status)) {
+      if (!STATUS_VALUES.includes(body.status)) {
         sendJson(response, 400, { error: '상태는 active, done, none 중 하나여야 합니다.' });
         return true;
       }
@@ -402,7 +393,7 @@ async function handleApi(request, response) {
         else sessionStatus.delete(sessionId);
         throw error;
       }
-      sendJson(response, 200, { session: publicSessionWithState(session), statusCounts: statusCounts() });
+      sendJson(response, 200, { session: publicSessionWithState(session) });
     } catch (error) {
       sendJson(response, 500, { error: error.message });
     }
@@ -459,7 +450,7 @@ async function handleApi(request, response) {
         status.totalCount = sessionMap.size;
         status.indexedCount = Math.min(status.indexedCount, status.totalCount);
         persistCache();
-        sendJson(response, 200, { deleted: session.id, statusCounts: statusCounts() });
+        sendJson(response, 200, { deleted: session.id });
         return true;
       }
 
@@ -489,20 +480,25 @@ async function handleApi(request, response) {
     const allSessions = sessionsSorted();
     const query = url.searchParams.get('q') || '';
     const folder = url.searchParams.get('folder') || '';
-    const statusFilter = url.searchParams.get('status') || '';
+    const statuses = (url.searchParams.get('status') || '').split(',').filter((value) => STATUS_VALUES.includes(value));
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 100);
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
     const from = url.searchParams.get('from') || '';
     const to = url.searchParams.get('to') || '';
-    // 작업 중 목록은 기간을 무시한다. 북마크가 기간 밖으로 밀려 사라지면 기능이 무의미해진다.
-    const scoped = statusFilter
-      ? allSessions.filter((session) => sessionStatus.get(session.id) === statusFilter)
-      : filterSessions(allSessions, { from, to });
-    const filtered = filterSessions(scoped, { query, folder });
+
+    const scoped = filterSessions(allSessions, { from, to });
+    const searched = filterSessions(scoped, { query, folder });
+    // 상태 칩 숫자는 자기 자신을 땜 나머지 조건 기준이다. 눌렀을 때 나오는 개수와 같아야 한다.
+    const counts = { none: 0, active: 0, done: 0 };
+    for (const session of searched) counts[sessionStatus.get(session.id) || 'none'] += 1;
+    const filtered = statuses.length
+      ? searched.filter((session) => statuses.includes(sessionStatus.get(session.id) || 'none'))
+      : searched;
+
     const summaryOnly = url.searchParams.get('summaryOnly') === '1';
     const page = summaryOnly ? [] : filtered.slice(offset, offset + limit);
     sendJson(response, 200, {
-      summary: getSummary(scoped),
+      summary: { ...getSummary(scoped), statusCounts: counts },
       resultCount: filtered.length,
       offset,
       nextOffset: offset + page.length,
