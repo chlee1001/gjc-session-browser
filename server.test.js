@@ -68,24 +68,36 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
     assert.equal(listing.summary.indexing, false, diagnostics);
     assert.equal(listing.sessions[0].id, sessionId);
 
-    const focusResponse = await fetch(`${baseUrl}/api/focus/${sessionId}`, { method: 'PUT' });
-    const focused = await focusResponse.json();
-    assert.equal(focusResponse.status, 200, focused.error || diagnostics);
-    assert.equal(focused.session.focused, true);
-    assert.equal(focused.summary.focusedCount, 1);
+    const setStatus = async (status) => {
+      const response = await fetch(`${baseUrl}/api/status/${sessionId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      return { response, body: await response.json() };
+    };
 
-    const focusedListing = await (await fetch(`${baseUrl}/api/sessions?focus=1`)).json();
-    assert.equal(focusedListing.resultCount, 1);
-    assert.equal(focusedListing.sessions[0].id, sessionId);
+    const active = await setStatus('active');
+    assert.equal(active.response.status, 200, active.body.error || diagnostics);
+    assert.equal(active.body.session.status, 'active');
+    assert.deepEqual(active.body.statusCounts, { active: 1, done: 0 });
+    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=active`)).json()).resultCount, 1);
 
-    const unfocusResponse = await fetch(`${baseUrl}/api/focus/${sessionId}`, { method: 'DELETE' });
-    const unfocused = await unfocusResponse.json();
-    assert.equal(unfocusResponse.status, 200, unfocused.error || diagnostics);
-    assert.equal(unfocused.session.focused, false);
-    assert.equal(unfocused.summary.focusedCount, 0);
-    assert.equal((await (await fetch(`${baseUrl}/api/sessions?focus=1`)).json()).resultCount, 0);
+    // 작업 중과 완료는 배타적이다. 완료로 바꾸면 작업 중에서 빠져야 한다.
+    const done = await setStatus('done');
+    assert.equal(done.body.session.status, 'done');
+    assert.deepEqual(done.body.statusCounts, { active: 0, done: 1 });
+    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=active`)).json()).resultCount, 0);
+    assert.equal((await (await fetch(`${baseUrl}/api/sessions?status=done`)).json()).resultCount, 1);
 
-    assert.equal((await fetch(`${baseUrl}/api/focus/${sessionId}`, { method: 'PUT' })).status, 200);
+    const cleared = await setStatus('none');
+    assert.equal(cleared.body.session.status, 'none');
+    assert.deepEqual(cleared.body.statusCounts, { active: 0, done: 0 });
+
+    const rejected = await setStatus('bogus');
+    assert.equal(rejected.response.status, 400);
+
+    assert.equal((await setStatus('done')).response.status, 200);
 
     const renameResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}`, {
       method: 'PATCH',
@@ -117,7 +129,7 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
     // 세션 파일과 동명 디렉터리는 그 세션의 아티팩트 폴더다. 함께 사라져야 한다.
     await assert.rejects(access(path.join(sessionDirectory, 'session')));
     const config = JSON.parse(await readFile(path.join(home, '.gjc', 'session-list.json'), 'utf8'));
-    assert.deepEqual(config.focusedSessionIds, []);
+    assert.deepEqual(config.sessionStatus, {}, '삭제된 세션의 상태는 설정에서 사라져야 한다');
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));

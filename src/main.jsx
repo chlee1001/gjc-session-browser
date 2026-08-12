@@ -67,6 +67,44 @@ function periodRange(period, customFrom, customTo) {
   return { from: from.toISOString(), to: '' };
 }
 
+const STATUSES = [
+  { value: 'active', label: '작업 중' },
+  { value: 'done', label: '완료' },
+];
+
+/** 받침 유무에 따라 조사를 고른다. "완료으로"같은 틀린 표기를 막는다. */
+function withParticle(word, afterConsonant, afterVowel) {
+  const last = word.charCodeAt(word.length - 1);
+  const hangul = last >= 0xac00 && last <= 0xd7a3;
+  return `${word}${hangul && (last - 0xac00) % 28 !== 0 ? afterConsonant : afterVowel}`;
+}
+
+/** 긴 경로나 ID처럼 그대로 써야 하는 값. 복사 버튼을 붙인다. */
+function CopyableValue({ label, value }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return undefined;
+    const timer = setTimeout(() => setCopied(false), 1400);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  if (!value) return <dd>—</dd>;
+  return (
+    <dd>
+      <code>{value}</code>
+      <button
+        type="button"
+        aria-label={`${label} 복사`}
+        data-state={copied ? 'success' : undefined}
+        onClick={() => navigator.clipboard.writeText(value).then(() => setCopied(true), () => {})}
+      >
+        {copied ? '복사됨' : '복사'}
+      </button>
+    </dd>
+  );
+}
+
 /** Keep Tab cycling inside one dialog panel. */
 function trapTabFocus(event, panel) {
   if (event.key !== 'Tab' || !panel) return;
@@ -90,10 +128,10 @@ function lockBodyScroll() {
   return () => { document.body.style.overflow = previousOverflow; };
 }
 
-const SessionRow = memo(function SessionRow({ session, onOpen, onToggleFocus }) {
+const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
   const model = splitModel(session.model);
   return (
-    <article className={session.focused ? 'session-row is-focused' : 'session-row'} id={`session-${session.id}`}>
+    <article className={`session-row is-${session.status}`} id={`session-${session.id}`}>
       <button className="session-open" type="button" onClick={() => onOpen(session)} aria-label={`${session.title} 상세 정보 열기`}>
         <div className="session-main">
           <div className="session-code" aria-hidden="true">{session.folderName.slice(0, 2).toUpperCase()}</div>
@@ -118,15 +156,23 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onToggleFocus }) 
           <strong>{model.name || '정보 없음'}</strong>
         </div>
       </button>
-      <button
-        className="session-focus"
-        type="button"
-        aria-pressed={session.focused}
-        aria-label={session.focused ? `${session.title} 작업 중 표시 해제` : `${session.title} 작업 중으로 표시`}
-        onClick={() => onToggleFocus(session.id, !session.focused)}
-      >
-        {session.focused ? '작업 중' : '추가'}
-      </button>
+      <div className="session-status">
+        {STATUSES.map((item) => {
+          const on = session.status === item.value;
+          return (
+            <button
+              key={item.value}
+              className={`session-mark is-${item.value}`}
+              type="button"
+              aria-pressed={on}
+              aria-label={on ? `${session.title} ${item.label} 표시 해제` : `${session.title} ${withParticle(item.label, '으로', '로')} 표시`}
+              onClick={() => onSetStatus(session.id, on ? 'none' : item.value)}
+            >
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
     </article>
   );
 });
@@ -181,11 +227,10 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
   );
 }
 
-function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onToggleFocus }) {
-  const [copied, setCopied] = useState(false);
+function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onSetStatus }) {
   const [title, setTitle] = useState('');
   const [saving, setSaving] = useState(false);
-  const [focusSaving, setFocusSaving] = useState(false);
+  const [statusSaving, setStatusSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [mutationError, setMutationError] = useState('');
@@ -195,9 +240,8 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
   useEffect(() => {
     if (!selected) return undefined;
     setTitle(selected.title);
-    setCopied(false);
     setConfirmingDelete(false);
-    setFocusSaving(false);
+    setStatusSaving(false);
     setMutationError('');
     const restoreScroll = lockBodyScroll();
     closeRef.current?.focus();
@@ -213,12 +257,6 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
 
   if (!selected) return null;
   const session = detail || selected;
-
-  const copyId = async () => {
-    await navigator.clipboard.writeText(session.id);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1400);
-  };
 
   const rename = async (event) => {
     event.preventDefault();
@@ -246,15 +284,15 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     }
   };
 
-  const toggleFocus = async () => {
-    setFocusSaving(true);
+  const changeStatus = async (next) => {
+    setStatusSaving(true);
     setMutationError('');
     try {
-      await onToggleFocus(session.id, !session.focused);
-    } catch (focusError) {
-      setMutationError(focusError.message);
+      await onSetStatus(session.id, next);
+    } catch (statusError) {
+      setMutationError(statusError.message);
     } finally {
-      setFocusSaving(false);
+      setStatusSaving(false);
     }
   };
 
@@ -272,18 +310,32 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
         {error ? <div className="detail-state is-error">{error}</div> : null}
         {!loading && !error && detail ? (
           <div className="detail-content">
-            <button className="detail-focus-toggle" type="button" aria-pressed={session.focused} onClick={toggleFocus} disabled={focusSaving || deleting}>
-              {focusSaving ? '저장 중' : session.focused ? '작업 중에서 제거' : '작업 중으로 표시'}
-            </button>
+            <div className="detail-status" role="group" aria-label="세션 상태">
+              {STATUSES.map((item) => {
+                const on = session.status === item.value;
+                return (
+                  <button
+                    key={item.value}
+                    className={`session-mark is-${item.value}`}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => changeStatus(on ? 'none' : item.value)}
+                    disabled={statusSaving || deleting}
+                  >
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
             <form className="rename-form" onSubmit={rename}>
               <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled} /></label>
               <button type="submit" disabled={saving || deleting || mutationDisabled || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
             </form>
 
             <dl className="detail-grid">
-              <div><dt>세션 ID</dt><dd><code>{session.id}</code><button type="button" onClick={copyId} data-state={copied ? 'success' : undefined}>{copied ? '복사됨' : '복사'}</button></dd></div>
-              <div><dt>작업 폴더</dt><dd><code>{session.cwd || '—'}</code></dd></div>
-              <div><dt>세션 파일</dt><dd><code>{session.filePath}</code></dd></div>
+              <div><dt>세션 ID</dt><CopyableValue label="세션 ID" value={session.id} /></div>
+              <div><dt>작업 폴더</dt><CopyableValue label="작업 폴더" value={session.cwd} /></div>
+              <div><dt>세션 파일</dt><CopyableValue label="세션 파일" value={session.filePath} /></div>
               <div><dt>모델</dt><dd><code>{session.model || '—'}</code></dd></div>
               <div><dt>시작</dt><dd>{new Date(session.startedAt).toLocaleString('ko-KR')}</dd></div>
               <div><dt>최근 활동</dt><dd>{new Date(session.lastActivity).toLocaleString('ko-KR')}</dd></div>
@@ -324,7 +376,9 @@ function App() {
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [folder, setFolder] = useState('');
-  const [focusOnly, setFocusOnly] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('');
+  // 사이드바 숫자는 기간과 무관하게 전체 기준이라 요약과 별도로 든다.
+  const [statusCounts, setStatusCounts] = useState({ active: 0, done: 0 });
   const [period, setPeriod] = useState(DEFAULT_PERIOD);
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
@@ -357,13 +411,14 @@ function App() {
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
     const { from, to } = periodRange(period, customFrom, customTo);
-    const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilter, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
     if (force) params.set('refresh', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
     if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
     const result = await response.json();
     if (generation !== listGenerationRef.current) return;
     setSummary(result.summary);
+    setStatusCounts(result.summary.statusCounts);
     setResultCount(result.resultCount);
     setHasMore(result.hasMore);
     setNextOffset(result.nextOffset);
@@ -372,7 +427,7 @@ function App() {
       const existing = new Set(current.map((session) => session.id));
       return [...current, ...result.sessions.filter((session) => !existing.has(session.id))];
     });
-  }, [deferredQuery, folder, focusOnly, period, customFrom, customTo]);
+  }, [deferredQuery, folder, statusFilter, period, customFrom, customTo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -396,17 +451,18 @@ function App() {
     if (!summary?.indexing) return undefined;
     const timer = setTimeout(async () => {
       const { from, to } = periodRange(period, customFrom, customTo);
-      const params = new URLSearchParams({ q: deferredQuery, folder, focus: focusOnly ? '1' : '0', from, to, summaryOnly: '1' });
+      const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilter, from, to, summaryOnly: '1' });
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
         setSummary(result.summary);
+        setStatusCounts(result.summary.statusCounts);
         setResultCount(result.resultCount);
       } catch {
         // The next list request will recover the status.
       }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [summary, deferredQuery, folder, focusOnly, period, customFrom, customTo]);
+  }, [summary, deferredQuery, folder, statusFilter, period, customFrom, customTo]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current) return;
@@ -553,7 +609,6 @@ function App() {
     if (!response.ok) throw new Error(result.error || '세션 제목을 변경하지 못했습니다.');
 
     applySessionUpdate(sessionId, result.session);
-    setSummary(result.summary);
     return result.session;
   }, [applySessionUpdate]);
 
@@ -567,18 +622,25 @@ function App() {
     if (!response.ok) throw new Error(result.error || '세션을 삭제하지 못했습니다.');
 
     dropSession(sessionId);
-    setSummary(result.summary);
+    setStatusCounts(result.statusCounts);
+    // 통계는 기간에 맞춰져 있으므로 서버가 다시 계산해야 맞는다.
+    setRequestKey((key) => key + 1);
   }, [dropSession]);
 
-  const toggleFocus = useCallback(async (sessionId, focused) => {
-    const response = await fetch(`/api/focus/${encodeURIComponent(sessionId)}`, { method: focused ? 'PUT' : 'DELETE' });
+  const setSessionStatus = useCallback(async (sessionId, next) => {
+    const response = await fetch(`/api/status/${encodeURIComponent(sessionId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: next }),
+    });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || '작업 중 상태를 변경하지 못했습니다.');
+    if (!response.ok) throw new Error(result.error || '상태를 변경하지 못했습니다.');
 
-    if (focusOnly && !focused) dropSession(sessionId);
+    // 상태로 걸러보는 중이라면 그 상태를 벗어난 세션은 목록에서 빠진다.
+    if (statusFilter && result.session.status !== statusFilter) dropSession(sessionId);
     else applySessionUpdate(sessionId, result.session);
-    setSummary(result.summary);
-  }, [focusOnly, applySessionUpdate, dropSession]);
+    setStatusCounts(result.statusCounts);
+  }, [statusFilter, applySessionUpdate, dropSession]);
 
   const refresh = () => {
     forceRefresh.current = true;
@@ -606,8 +668,8 @@ function App() {
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
   const dialogOpen = paletteOpen || Boolean(selected);
-  const scopeLabel = focusOnly
-    ? '작업 중'
+  const scopeLabel = statusFilter
+    ? STATUSES.find((item) => item.value === statusFilter).label
     : period === 'custom'
       ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
       : PERIODS.find((item) => item.value === period).label;
@@ -647,18 +709,28 @@ function App() {
           <aside className="filters">
             <section>
               <h2>범위</h2>
-              <button className="focus-filter" type="button" aria-pressed={focusOnly} onClick={() => setFocusOnly((current) => !current)}>
-                <span>작업 중</span><strong>{number.format(summary?.focusedCount || 0)}</strong>
-              </button>
+              <div className="status-filters" role="group" aria-label="상태로 걸러보기">
+                {STATUSES.map((item) => (
+                  <button
+                    key={item.value}
+                    className={`status-filter is-${item.value}`}
+                    type="button"
+                    aria-pressed={statusFilter === item.value}
+                    onClick={() => setStatusFilter((current) => (current === item.value ? '' : item.value))}
+                  >
+                    <span>{item.label}</span><strong>{number.format(statusCounts[item.value])}</strong>
+                  </button>
+                ))}
+              </div>
               <label>
                 <span>기간</span>
                 <span className="select-shell">
-                  <select value={period} onChange={(event) => setPeriod(event.target.value)} disabled={focusOnly}>
+                  <select value={period} onChange={(event) => setPeriod(event.target.value)} disabled={Boolean(statusFilter)}>
                     {PERIODS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   </select>
                 </span>
               </label>
-              {period === 'custom' && !focusOnly ? (
+              {period === 'custom' && !statusFilter ? (
                 <div className="date-range">
                   <label>
                     <span>시작</span>
@@ -670,7 +742,7 @@ function App() {
                   </label>
                 </div>
               ) : null}
-              {focusOnly ? <p className="scope-note">작업 중 목록은 기간과 무관하게 모두 보여줍니다.</p> : null}
+              {statusFilter ? <p className="scope-note">상태로 걸러볼 때는 기간과 무관하게 모두 보여줍니다.</p> : null}
               <label>
                 <span>작업 폴더</span>
                 <span className="select-shell">
@@ -697,13 +769,13 @@ function App() {
             <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>{scopeLabel} · 최근 활동순</span></header>
             {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
-            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{focusOnly ? '작업 중으로 표시한 세션이 없습니다.' : `${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
+            {!error && !loading && sessions.length === 0 ? <div className="empty-state">{statusFilter ? `${withParticle(scopeLabel, '으로', '로')} 표시한 세션이 없습니다.` : `${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
             <div ref={listRef} className="virtual-list" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
               {virtualRows.map((virtualRow) => {
                 const session = sessions[virtualRow.index];
                 return (
                   <div key={virtualRow.key} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} className="virtual-row" style={{ transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)` }}>
-                    <SessionRow session={session} onOpen={openDetail} onToggleFocus={toggleFocus} />
+                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} />
                   </div>
                 );
               })}
@@ -718,7 +790,7 @@ function App() {
       </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
-      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onToggleFocus={toggleFocus} />
+      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} />
     </div>
   );
 }

@@ -21,7 +21,7 @@ const decompress = promisify(gunzip);
 const runFile = promisify(execFileCallback);
 
 let customDirectories = [];
-let focusedSessionIds = new Set();
+let sessionStatus = new Map();
 let sessionMap = new Map();
 let initialized = false;
 let initializePromise = null;
@@ -51,7 +51,14 @@ async function loadDirectories() {
     // A missing or malformed config falls back to an empty configuration.
   }
   customDirectories = Array.isArray(config.directories) ? config.directories.map(expandHome) : [];
-  focusedSessionIds = new Set(Array.isArray(config.focusedSessionIds) ? config.focusedSessionIds.filter((id) => typeof id === 'string') : []);
+  sessionStatus = new Map();
+  // 이전 형식(focusedSessionIds)은 작업 중으로 옮긴다. 저장은 새 형식으로만 한다.
+  for (const id of Array.isArray(config.focusedSessionIds) ? config.focusedSessionIds : []) {
+    if (typeof id === 'string') sessionStatus.set(id, 'active');
+  }
+  for (const [id, value] of Object.entries(config.sessionStatus || {})) {
+    if (value === 'active' || value === 'done') sessionStatus.set(id, value);
+  }
 }
 
 function configuredDirectories() {
@@ -67,9 +74,12 @@ function configuredDirectories() {
   ].filter(Boolean).map(expandHome))];
 }
 
-async function saveCustomDirectories() {
+async function saveConfig() {
   await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, JSON.stringify({ directories: customDirectories, focusedSessionIds: [...focusedSessionIds] }, null, 2));
+  await writeFile(configPath, JSON.stringify({
+    directories: customDirectories,
+    sessionStatus: Object.fromEntries(sessionStatus),
+  }, null, 2));
 }
 
 async function saveCache(currentGeneration) {
@@ -160,7 +170,7 @@ function persistCache() {
 }
 
 function publicSessionWithState(session) {
-  return { ...publicSession(session), focused: focusedSessionIds.has(session.id) };
+  return { ...publicSession(session), status: sessionStatus.get(session.id) || 'none' };
 }
 
 function sendJson(response, statusCode, value) {
@@ -171,13 +181,14 @@ function sendJson(response, statusCode, value) {
   response.end(JSON.stringify(value));
 }
 
-// 북마크 수는 기간과 무관하게 전체 인덱스 기준이어야 사이드바 숫자가 맞는다.
-function focusedSessionCount() {
-  let count = 0;
+// 상태 수는 기간과 무관하게 전체 인덱스 기준이어야 사이드바 숫자가 맞는다.
+function statusCounts() {
+  const counts = { active: 0, done: 0 };
   for (const session of sessionMap.values()) {
-    if (focusedSessionIds.has(session.id)) count += 1;
+    const value = sessionStatus.get(session.id);
+    if (value === 'active' || value === 'done') counts[value] += 1;
   }
-  return count;
+  return counts;
 }
 
 function getSummary(sessions) {
@@ -195,7 +206,7 @@ function getSummary(sessions) {
 
   return {
     sessionCount: sessions.length,
-    focusedCount: focusedSessionCount(),
+    statusCounts: statusCounts(),
     folderCount: folders.size,
     totalMessages,
     totalTokens,
@@ -353,7 +364,7 @@ async function handleApi(request, response) {
       if (!directoryStat.isDirectory()) throw new Error('폴더가 아닙니다.');
       if (!configuredDirectories().includes(directory)) {
         customDirectories.push(directory);
-        await saveCustomDirectories();
+        await saveConfig();
       }
       await initializeIndex(true);
       sendJson(response, 200, { directories: configuredDirectories() });
@@ -363,30 +374,35 @@ async function handleApi(request, response) {
     return true;
   }
 
-  if (url.pathname.startsWith('/api/focus/')) {
+  if (url.pathname.startsWith('/api/status/')) {
     try {
       await initializeIndex();
-      const sessionId = decodeURIComponent(url.pathname.slice('/api/focus/'.length));
+      const sessionId = decodeURIComponent(url.pathname.slice('/api/status/'.length));
       const session = findSessionById(sessionId);
       if (!session) {
         sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
         return true;
       }
-      const wasFocused = focusedSessionIds.has(sessionId);
-      if (request.method === 'PUT') focusedSessionIds.add(sessionId);
-      else if (request.method === 'DELETE') focusedSessionIds.delete(sessionId);
-      else {
+      if (request.method !== 'PUT') {
         sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
         return true;
       }
+      const body = await readBody(request);
+      if (!['active', 'done', 'none'].includes(body.status)) {
+        sendJson(response, 400, { error: '상태는 active, done, none 중 하나여야 합니다.' });
+        return true;
+      }
+      const previous = sessionStatus.get(sessionId);
+      if (body.status === 'none') sessionStatus.delete(sessionId);
+      else sessionStatus.set(sessionId, body.status);
       try {
-        await saveCustomDirectories();
+        await saveConfig();
       } catch (error) {
-        if (wasFocused) focusedSessionIds.add(sessionId);
-        else focusedSessionIds.delete(sessionId);
+        if (previous) sessionStatus.set(sessionId, previous);
+        else sessionStatus.delete(sessionId);
         throw error;
       }
-      sendJson(response, 200, { session: publicSessionWithState(session), summary: getSummary(sessionsSorted()) });
+      sendJson(response, 200, { session: publicSessionWithState(session), statusCounts: statusCounts() });
     } catch (error) {
       sendJson(response, 500, { error: error.message });
     }
@@ -420,7 +436,7 @@ async function handleApi(request, response) {
         sessionMap.set(session.filePath, updated);
         detailCache.delete(session.filePath);
         persistCache();
-        sendJson(response, 200, { session: publicSessionWithState(updated), summary: getSummary(sessionsSorted()) });
+        sendJson(response, 200, { session: publicSessionWithState(updated) });
         return true;
       }
 
@@ -437,13 +453,13 @@ async function handleApi(request, response) {
         await deleteStoredSession(session);
         sessionMap.delete(session.filePath);
         detailCache.delete(session.filePath);
-        if (focusedSessionIds.delete(session.id)) {
-          await saveCustomDirectories().catch((error) => console.error('Session config save failed:', error.message));
+        if (sessionStatus.delete(session.id)) {
+          await saveConfig().catch((error) => console.error('Session config save failed:', error.message));
         }
         status.totalCount = sessionMap.size;
         status.indexedCount = Math.min(status.indexedCount, status.totalCount);
         persistCache();
-        sendJson(response, 200, { deleted: session.id, summary: getSummary(sessionsSorted()) });
+        sendJson(response, 200, { deleted: session.id, statusCounts: statusCounts() });
         return true;
       }
 
@@ -473,14 +489,14 @@ async function handleApi(request, response) {
     const allSessions = sessionsSorted();
     const query = url.searchParams.get('q') || '';
     const folder = url.searchParams.get('folder') || '';
-    const focusOnly = url.searchParams.get('focus') === '1';
+    const statusFilter = url.searchParams.get('status') || '';
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 100);
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
     const from = url.searchParams.get('from') || '';
     const to = url.searchParams.get('to') || '';
     // 작업 중 목록은 기간을 무시한다. 북마크가 기간 밖으로 밀려 사라지면 기능이 무의미해진다.
-    const scoped = focusOnly
-      ? allSessions.filter((session) => focusedSessionIds.has(session.id))
+    const scoped = statusFilter
+      ? allSessions.filter((session) => sessionStatus.get(session.id) === statusFilter)
       : filterSessions(allSessions, { from, to });
     const filtered = filterSessions(scoped, { query, folder });
     const summaryOnly = url.searchParams.get('summaryOnly') === '1';
