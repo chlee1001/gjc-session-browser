@@ -132,23 +132,102 @@ function lockBodyScroll() {
 }
 
 /** 기간 통계의 토큰을 응답에 적힌 모델로 쪼개 보여 준다. 한 세션이 여러 모델에 걸치므로 모델별 세션 수를 더하면 전체 세션 수보다 클 수 있다. */
-function ModelUsage({ models, totalTokens, scopeLabel }) {
+function ModelUsage({ models, totalTokens, scopeLabel, period, customFrom, customTo, revision, panelResetKey, onArchive }) {
   const [open, setOpen] = useState(true);
+  const [panels, setPanels] = useState({});
+  const requestsRef = useRef({});
+  const disclosureRefs = useRef({});
+  const { from, to } = periodRange(period, customFrom, customTo);
+
+  const load = async (model, reset = false) => {
+    const panel = panels[model] || { rows: [] };
+    const offset = reset ? 0 : panel.rows.length;
+    const requestRevision = reset ? revision : panel.revision;
+    if (offset > 0 && !requestRevision) return;
+    requestsRef.current[model]?.abort();
+    const controller = new AbortController();
+    requestsRef.current[model] = controller;
+    setPanels((current) => {
+      const currentPanel = current[model] || { rows: [] };
+      return { ...current, [model]: { ...currentPanel, rows: reset ? [] : currentPanel.rows, loading: true, error: '', stale: reset ? false : currentPanel.stale } };
+    });
+    const params = new URLSearchParams({ model, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    if (requestRevision) params.set('revision', requestRevision);
+    try {
+      const response = await fetch(`/api/models/sessions?${params}`, { signal: controller.signal });
+      const result = await response.json();
+      if (requestsRef.current[model] !== controller) return;
+      if (response.status === 409 && result.code === 'stale_revision') {
+        setPanels((current) => {
+          const currentPanel = current[model] || panel;
+          return { ...current, [model]: { ...currentPanel, stale: true, loading: false, error: '' } };
+        });
+        return;
+      }
+      if (!response.ok) throw new Error(result.error || '모델 기여 세션을 불러오지 못했습니다.');
+      setPanels((current) => {
+        const currentPanel = current[model] || panel;
+        const rows = reset ? result.contributions : [...currentPanel.rows, ...result.contributions.filter((row) => !currentPanel.rows.some((old) => old.id === row.id))];
+        return {
+          ...current,
+          [model]: {
+            ...currentPanel,
+            rows,
+            revision: result.revision,
+            hasMore: result.hasMore,
+            loading: false,
+            stale: false,
+            error: '',
+          },
+        };
+      });
+    } catch (loadError) {
+      if (loadError.name === 'AbortError' || requestsRef.current[model] !== controller) return;
+      setPanels((current) => {
+        const currentPanel = current[model] || panel;
+        return { ...current, [model]: { ...currentPanel, loading: false, error: loadError.message } };
+      });
+    }
+  };
+
+  useEffect(() => {
+    Object.values(requestsRef.current).forEach((controller) => controller.abort());
+    requestsRef.current = {};
+    setPanels({});
+  }, [panelResetKey]);
+
+  useEffect(() => {
+    Object.values(requestsRef.current).forEach((controller) => controller.abort());
+    requestsRef.current = {};
+    setPanels((current) => Object.fromEntries(Object.entries(current).map(([model, panel]) => [
+      model,
+      panel.open ? { ...panel, stale: true } : panel,
+    ])));
+  }, [revision]);
+
+  const visibleModels = [...models];
+  const currentModelIds = new Set(models.map((item) => item.id));
+  for (const panel of Object.values(panels)) {
+    if (panel.open && panel.item && !currentModelIds.has(panel.item.id)) {
+      visibleModels.push({ ...panel.item, removed: true });
+    }
+  }
 
   return (
     <section className="model-usage" aria-label="모델별 사용량">
       <header>
         <div><h2>모델별 사용량</h2><p>{scopeLabel} · 응답에 기록된 모델 기준 · 서브에이전트 포함</p></div>
         <button type="button" aria-expanded={open} aria-controls="model-usage-body" onClick={() => setOpen((value) => !value)}>
-          {open ? '접기' : `모델 ${number.format(models.length)}개 펼치기`}
+          {open ? '접기' : `모델 ${number.format(visibleModels.length)}개 펼치기`}
         </button>
       </header>
       <div id="model-usage-body" hidden={!open}>
-        {models.length === 0 ? <p className="model-empty">이 기간에는 집계된 토큰 사용량이 없습니다.</p> : (
+        {visibleModels.length === 0 ? <p className="model-empty">이 기간에는 집계된 토큰 사용량이 없습니다.</p> : (
           <ol className="model-list">
-            {models.map((item) => {
+            {visibleModels.map((item) => {
               const { vendor, name } = splitModel(item.id);
               const share = totalTokens ? item.tokens / totalTokens : 0;
+              const panel = panels[item.id] || { rows: [] };
               return (
                 <li key={item.id}>
                   <div className="model-label" title={item.id || undefined}>
@@ -162,6 +241,42 @@ function ModelUsage({ models, totalTokens, scopeLabel }) {
                     <div><dt>응답</dt><dd>{number.format(item.responses)}</dd></div>
                     <div><dt>세션</dt><dd>{number.format(item.sessions)}</dd></div>
                   </dl>
+                  <div className="model-contributions">
+                    <button
+                      type="button"
+                      ref={(node) => { disclosureRefs.current[item.id] = node; }}
+                      aria-expanded={Boolean(panel.open)}
+                      onClick={() => {
+                        const nextOpen = !panel.open;
+                        setPanels((current) => ({
+                          ...current,
+                          [item.id]: nextOpen
+                            ? { ...(current[item.id] || panel), item: { ...item, removed: undefined }, open: true }
+                            : { open: false, rows: [], item: current[item.id]?.item || item },
+                        }));
+                        if (!nextOpen) requestsRef.current[item.id]?.abort();
+                        if (nextOpen && !panel.rows.length) void load(item.id);
+                      }}
+                    >{panel.open ? '기여 세션 접기' : '기여 세션 보기'}</button>
+                    {panel.open ? (
+                      <div>
+                        {panel.stale ? <div className="stale-panel" role="status">데이터가 갱신됨 · <button type="button" onClick={() => { void load(item.id, true); requestAnimationFrame(() => disclosureRefs.current[item.id]?.focus()); }}>새로 보기</button></div> : null}
+                        {panel.error ? <p className="mutation-message is-error" role="alert">{panel.error}</p> : null}
+                        {panel.rows.map((row) => (
+                          <div className="contribution-row" key={row.id}>
+                            <div><strong>{row.title}</strong><span>{row.preview || '미리보기 없음'}</span><small>{row.folderName} · {formatRelative(row.lastActivity)}</small></div>
+                            <span>{item.tokens ? percent.format(row.usage.tokens / item.tokens) : '—'} · {number.format(row.usage.tokens)} 토큰 · {money.format(row.usage.cost)}</span>
+                            <button type="button" onClick={() => { onArchive(row, !row.archived, 'model').finally(() => requestAnimationFrame(() => disclosureRefs.current[item.id]?.focus())); }} disabled={panel.stale}>{row.archived ? '복원' : '보관'}</button>
+                          </div>
+                        ))}
+                        {panel.loading ? <p role="status">기여 세션을 불러오는 중</p> : null}
+                        {!panel.loading && panel.hasMore && !panel.stale ? <button type="button" onClick={() => void load(item.id)}>더 보기</button> : null}
+                        {!panel.loading && !panel.rows.length && !panel.error
+                          ? <p role="status">이 모델은 현재 기간에 없습니다.</p>
+                          : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </li>
               );
             })}
@@ -172,7 +287,7 @@ function ModelUsage({ models, totalTokens, scopeLabel }) {
   );
 }
 
-const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
+const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onArchive, selected, onSelect }) {
   // 세션 헤더의 모델은 마지막으로 고른 하나라 실제로 쓴 모델을 대표하지 못한다. 토큰을 가장 많이 쓴 쪽을 앞에 세운다.
   const model = splitModel(session.models[0]?.id || session.model);
   return (
@@ -184,6 +299,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
             <div className="session-title-line">
               <h2>{session.title}</h2>
               <span className="session-id">{session.id.slice(0, 8)}</span>
+              {session.archived ? <span className="archive-badge">보관됨</span> : null}
             </div>
             {session.preview ? <p>{session.preview}</p> : null}
             <span className="session-path" title={session.cwd}>{session.cwd || '작업 폴더 정보 없음'}</span>
@@ -201,6 +317,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
           <strong>{model.name || '정보 없음'}{session.models.length > 1 ? <em>외 {session.models.length - 1}</em> : null}</strong>
         </div>
       </button>
+      <label className="session-select"><input type="checkbox" checked={selected} onChange={() => onSelect(session.id)} aria-label={`${session.title} 선택`} /></label>
       <div className="session-status">
         {STATUSES.map((item) => {
           const on = session.status === item.value;
@@ -211,12 +328,16 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
               type="button"
               aria-pressed={on}
               aria-label={on ? `${session.title} ${item.label} 표시 해제` : `${session.title} ${withParticle(item.label, '으로', '로')} 표시`}
-              onClick={() => onSetStatus(session.id, on ? 'none' : item.value, session.status)}
+              onClick={() => onSetStatus(session.id, on ? 'none' : item.value)}
             >
               {item.label}
             </button>
           );
         })}
+        <button className="session-mark is-archive" type="button" title="목록에서만 숨김 · 통계 유지" aria-describedby={`archive-help-${session.id}`} onClick={() => onArchive(session, !session.archived, 'list')}>
+          {session.archived ? '복원' : '보관'}
+        </button>
+        <span id={`archive-help-${session.id}`} className="sr-only">목록에서만 숨김 · 통계 유지</span>
       </div>
     </article>
   );
@@ -272,22 +393,35 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
   );
 }
 
-function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onSetStatus }) {
+function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onSetStatus, onArchive }) {
   const [title, setTitle] = useState('');
   const [saving, setSaving] = useState(false);
   const [statusSaving, setStatusSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [mutationError, setMutationError] = useState('');
+  const [preflight, setPreflight] = useState(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+  const [deleteWord, setDeleteWord] = useState('');
+  const [partialDelete, setPartialDelete] = useState(null);
   const closeRef = useRef(null);
   const panelRef = useRef(null);
+  const retryRef = useRef(null);
+  const deleteRevealRef = useRef(null);
+  const preflightRequestRef = useRef(null);
 
   useEffect(() => {
     if (!selected) return undefined;
     setTitle(selected.title);
     setConfirmingDelete(false);
     setStatusSaving(false);
+    setDeleting(false);
+    setSaving(false);
     setMutationError('');
+    setPreflight(null);
+    setDeleteWord('');
+    setPartialDelete(null);
+    preflightRequestRef.current?.abort();
     const restoreScroll = lockBodyScroll();
     closeRef.current?.focus();
     const onKeyDown = (event) => {
@@ -295,10 +429,15 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     };
     document.addEventListener('keydown', onKeyDown);
     return () => {
+      preflightRequestRef.current?.abort();
       document.removeEventListener('keydown', onKeyDown);
       restoreScroll();
     };
-  }, [selected, onClose]);
+  }, [selected?.id, onClose]);
+
+  useEffect(() => {
+    if (partialDelete) requestAnimationFrame(() => retryRef.current?.focus());
+  }, [partialDelete]);
 
   if (!selected) return null;
   const session = detail || selected;
@@ -324,16 +463,44 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     try {
       await onDelete(session.id);
     } catch (deleteError) {
-      setMutationError(deleteError.message);
-      setDeleting(false);
+      if (deleteError.code === 'partial_delete' || deleteError.code === 'delete_failed') {
+        setPartialDelete(deleteError);
+        setConfirmingDelete(false);
+      } else {
+        setMutationError(deleteError.message);
+      }
+    } finally { setDeleting(false); }
+  };
+
+  const revealDelete = async () => {
+    setConfirmingDelete(true);
+    setPreflightLoading(true);
+    setMutationError('');
+    preflightRequestRef.current?.abort();
+    const controller = new AbortController();
+    preflightRequestRef.current = controller;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/delete-preflight`, { signal: controller.signal });
+      const result = await response.json();
+      if (preflightRequestRef.current !== controller) return;
+      if (Array.isArray(result.pairs)) setPreflight({ ...result, sessionId: session.id });
+      if (!response.ok || result.authorized === false || !Array.isArray(result.pairs)) {
+        throw new Error(result.error || (result.code === 'delete_preflight_failed'
+          ? '삭제 권한을 확인하지 못한 경로가 있습니다.'
+          : result.code) || '삭제 범위를 확인하지 못했습니다.');
+      }
+    } catch (preflightError) {
+      if (preflightError.name !== 'AbortError' && preflightRequestRef.current === controller) setMutationError(preflightError.message);
+    } finally {
+      if (preflightRequestRef.current === controller) setPreflightLoading(false);
     }
   };
 
-  const changeStatus = async (next, previous) => {
+  const changeStatus = async (next) => {
     setStatusSaving(true);
     setMutationError('');
     try {
-      await onSetStatus(session.id, next, previous);
+      await onSetStatus(session.id, next);
     } catch (statusError) {
       setMutationError(statusError.message);
     } finally {
@@ -364,14 +531,16 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
                     className={`session-mark is-${item.value}`}
                     type="button"
                     aria-pressed={on}
-                    onClick={() => changeStatus(on ? 'none' : item.value, session.status)}
+                    onClick={() => changeStatus(on ? 'none' : item.value)}
                     disabled={statusSaving || deleting}
                   >
                     {item.label}
                   </button>
                 );
               })}
+              <button className="session-mark is-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')}>{session.archived ? '복원' : '보관'}</button>
             </div>
+            <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
             <form className="rename-form" onSubmit={rename}>
               <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled} /></label>
               <button type="submit" disabled={saving || deleting || mutationDisabled || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
@@ -413,12 +582,16 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             <section className="danger-zone">
               <div><h3>세션 삭제</h3><p>세션 기록과 연결된 아티팩트를 영구 삭제합니다.</p></div>
               {!confirmingDelete ? (
-                <button type="button" onClick={() => setConfirmingDelete(true)} disabled={mutationDisabled}>삭제</button>
+                <button ref={deleteRevealRef} type="button" onClick={revealDelete} disabled={mutationDisabled}>삭제</button>
               ) : (
                 <div className="delete-confirm">
-                  <p>삭제 후 복구할 수 없습니다. 이 세션만 삭제합니다.</p>
-                  <button type="button" onClick={() => setConfirmingDelete(false)} disabled={deleting}>취소</button>
-                  <button className="confirm-delete" type="button" onClick={remove} disabled={deleting}>{deleting ? '삭제 중' : '영구 삭제'}</button>
+                  <p>삭제 후 복구할 수 없습니다. 아래 범위를 영구 삭제합니다.</p>
+                  {preflightLoading ? <p role="status">삭제 범위를 확인하는 중</p> : null}
+                  {preflight ? <div className="preflight-paths"><strong>세션 파일 {number.format(preflight.sourceCount ?? preflight.pairs?.length ?? 0)}개 · 아티팩트 폴더 {number.format(preflight.artifactCount ?? preflight.pairs?.length ?? 0)}개</strong><ul>{(preflight.pairs || []).map((pair) => <li key={`${pair.sourcePath}:${pair.artifactPath}`}><code>{pair.sourcePath}</code><code>{pair.artifactPath}</code>{pair.reason ? <span>{pair.reason}</span> : null}</li>)}</ul></div> : null}
+                  <label>확인 문구 <input value={deleteWord} onChange={(event) => setDeleteWord(event.target.value)} aria-describedby="delete-word-help" disabled={deleting} /></label>
+                  <small id="delete-word-help">영구삭제를 정확히 입력하세요.</small>
+                  <button type="button" onClick={() => { setConfirmingDelete(false); setPreflight(null); requestAnimationFrame(() => deleteRevealRef.current?.focus()); }} disabled={deleting}>취소</button>
+                  <button className="confirm-delete" type="button" onClick={remove} disabled={deleting || !preflight?.authorized || preflight.sessionId !== session.id || deleteWord !== '영구삭제'}>{deleting ? '삭제 중' : '영구 삭제'}</button>
                 </div>
               )}
             </section>
@@ -426,6 +599,27 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             {mutationDisabled ? <p className="mutation-message">인덱싱이 끝나면 제목 변경과 삭제를 사용할 수 있습니다.</p> : null}
             {mutationError ? <p className="mutation-message is-error" role="alert">{mutationError}</p> : null}
           </div>
+        ) : null}
+        {partialDelete ? (
+          <section className="partial-delete" aria-labelledby="partial-delete-title">
+            <div role="alert">
+              <h3 id="partial-delete-title">일부 항목을 삭제하지 못했습니다</h3>
+              <p>세션 파일 {number.format(partialDelete.remainingCopies || 0)}개 · 아티팩트 폴더 {number.format(partialDelete.remainingArtifacts || 0)}개가 남아 있습니다.</p>
+            </div>
+            <dl className="remaining-paths">
+              {(partialDelete.remainingPairs || []).map((pair) => (
+                <div key={`${pair.sourcePath}:${pair.artifactPath}`}>
+                  {pair.sourceExists ? <><dt>남은 세션 파일</dt><CopyableValue label="남은 세션 파일" value={pair.sourcePath} /></> : null}
+                  {pair.artifactExists ? <><dt>남은 아티팩트 폴더</dt><CopyableValue label="남은 아티팩트 폴더" value={pair.artifactPath} /></> : null}
+                  {pair.authorized === false ? <p>권한 확인 실패</p> : null}
+                </div>
+              ))}
+            </dl>
+            <div className="partial-delete-actions">
+              <button ref={retryRef} type="button" onClick={remove} disabled={deleting || !partialDelete.retryable}>{deleting ? '재시도 중' : '재시도'}</button>
+              <button type="button" onClick={onClose} disabled={deleting}>닫기</button>
+            </div>
+          </section>
         ) : null}
       </section>
     </div>
@@ -438,6 +632,9 @@ function App() {
   const [folder, setFolder] = useState('');
   const [statusFilters, setStatusFilters] = useState([]);
   const [statusCounts, setStatusCounts] = useState({ none: 0, active: 0, done: 0 });
+  const [archiveCounts, setArchiveCounts] = useState({ current: 0, archived: 0 });
+  const [archiveView, setArchiveView] = useState('current');
+  const [sort, setSort] = useState('recent');
   const [period, setPeriod] = useState(DEFAULT_PERIOD);
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
@@ -445,9 +642,16 @@ function App() {
   const [summary, setSummary] = useState(null);
   const [resultCount, setResultCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
-  const [nextOffset, setNextOffset] = useState(0);
+  const [modelRevision, setModelRevision] = useState('');
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [bulkConfirming, setBulkConfirming] = useState(false);
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [announcement, setAnnouncement] = useState('');
+  const [undo, setUndo] = useState(null);
+  const [undoSubmitting, setUndoSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [requestKey, setRequestKey] = useState(0);
+  const [panelResetKey, setPanelResetKey] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [directory, setDirectory] = useState('');
@@ -467,10 +671,30 @@ function App() {
   const detailRequestRef = useRef(null);
   const detailTriggerRef = useRef(null);
   const listGenerationRef = useRef(0);
+  const indexingCompletionRef = useRef(false);
+  const sessionsRef = useRef([]);
+  const resultCountRef = useRef(0);
+  const resultsHeadingRef = useRef(null);
+  const undoRef = useRef(null);
+  const undoSubmittingRef = useRef(false);
+  const filterResetRef = useRef('');
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+  useEffect(() => {
+    resultCountRef.current = resultCount;
+  }, [resultCount]);
+
+  useEffect(() => {
+    const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${sort}:${period}:${customFrom}:${customTo}`;
+    if (filterResetRef.current && filterResetRef.current !== key) setPanelResetKey((value) => value + 1);
+    filterResetRef.current = key;
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters]);
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
     const { from, to } = periodRange(period, customFrom, customTo);
-    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
     if (force) params.set('refresh', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
     if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
@@ -478,15 +702,19 @@ function App() {
     if (generation !== listGenerationRef.current) return;
     setSummary(result.summary);
     setStatusCounts(result.summary.statusCounts);
+    setArchiveCounts(result.summary.archiveCounts || {});
+    setModelRevision(result.summary.modelRevision || '');
     setResultCount(result.resultCount);
-    setHasMore(result.hasMore);
-    setNextOffset(result.nextOffset);
+    resultCountRef.current = result.resultCount;
+    const existing = append ? new Set(sessionsRef.current.map((session) => session.id)) : new Set();
+    const pageRows = append ? result.sessions.filter((session) => !existing.has(session.id)) : result.sessions;
+    setHasMore((append ? sessionsRef.current.length + pageRows.length : pageRows.length) < result.resultCount);
     setSessions((current) => {
       if (!append) return result.sessions;
-      const existing = new Set(current.map((session) => session.id));
-      return [...current, ...result.sessions.filter((session) => !existing.has(session.id))];
+      const currentIds = new Set(current.map((session) => session.id));
+      return [...current, ...result.sessions.filter((session) => !currentIds.has(session.id))];
     });
-  }, [deferredQuery, folder, statusFilters, period, customFrom, customTo]);
+  }, [deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -495,6 +723,8 @@ function App() {
     forceRefresh.current = false;
     setLoading(true);
     setSessions([]);
+    setSelectedIds(new Set());
+    setUndo(null);
     setError('');
     fetchPage(0, { force, signal: controller.signal, generation })
       .catch((fetchError) => {
@@ -508,34 +738,43 @@ function App() {
 
   useEffect(() => {
     if (!summary?.indexing) return undefined;
+    indexingCompletionRef.current = false;
     const timer = setTimeout(async () => {
       const { from, to } = periodRange(period, customFrom, customTo);
-      const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), from, to, summaryOnly: '1' });
+      const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, summaryOnly: '1' });
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
+        if (!result.summary.indexing && !indexingCompletionRef.current) {
+          indexingCompletionRef.current = true;
+          setPanelResetKey((key) => key + 1);
+          setRequestKey((key) => key + 1);
+        }
         setSummary(result.summary);
         setStatusCounts(result.summary.statusCounts);
+        setArchiveCounts(result.summary.archiveCounts || {});
+        setModelRevision(result.summary.modelRevision || '');
         setResultCount(result.resultCount);
+        resultCountRef.current = result.resultCount;
       } catch {
         // The next list request will recover the status.
       }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [summary, deferredQuery, folder, statusFilters, period, customFrom, customTo]);
+  }, [summary, deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
     try {
-      await fetchPage(nextOffset, { append: true, generation: listGenerationRef.current });
+      await fetchPage(sessions.length, { append: true, generation: listGenerationRef.current });
     } catch (fetchError) {
       setError(fetchError.message);
     } finally {
       loadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, [fetchPage, hasMore, nextOffset]);
+  }, [fetchPage, hasMore, sessions.length]);
 
   // 목록 시작 위치는 렌더가 아니라 레이아웃 이후에 잰다. 렌더 중 offsetTop 읽기는 매번 강제 리플로를 부른다.
   const [listOffset, setListOffset] = useState(0);
@@ -647,15 +886,49 @@ function App() {
   }, []);
 
   const applySessionUpdate = useCallback((sessionId, updated) => {
-    setSessions((current) => current.map((session) => session.id === sessionId ? updated : session));
+    const rows = sessionsRef.current.map((session) => session.id === sessionId ? updated : session);
+    sessionsRef.current = rows;
+    setSessions(rows);
     setSelected((current) => current?.id === sessionId ? { ...current, ...updated } : current);
     setDetail((current) => current?.id === sessionId ? { ...current, ...updated } : current);
   }, []);
 
-  const dropSession = useCallback((sessionId) => {
-    setSessions((current) => current.filter((session) => session.id !== sessionId));
-    setResultCount((current) => Math.max(0, current - 1));
-    closeDetail();
+  const reconcile = useCallback(async (expectedCount) => {
+    // Each reconciliation owns its expected count; an older response cannot overwrite a later archive delta.
+    const generation = ++listGenerationRef.current;
+    const { from, to } = periodRange(period, customFrom, customTo);
+    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: '0', limit: String(PAGE_SIZE), summaryOnly: '1' });
+    try {
+      const response = await fetch(`/api/sessions?${params}`);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '목록 통계를 확인하지 못했습니다.');
+      if (generation !== listGenerationRef.current) return;
+      setSummary(result.summary);
+      setStatusCounts(result.summary.statusCounts);
+      setArchiveCounts(result.summary.archiveCounts || {});
+      setModelRevision(result.summary.modelRevision || '');
+      setResultCount(result.resultCount);
+      resultCountRef.current = result.resultCount;
+      setHasMore(sessionsRef.current.length < result.resultCount);
+      if (result.resultCount !== expectedCount) {
+        setSessions([]);
+        setPanelResetKey((key) => key + 1);
+        setRequestKey((key) => key + 1);
+      }
+    } catch (reconcileError) {
+      if (generation !== listGenerationRef.current) return;
+      setError(reconcileError.message);
+      setPanelResetKey((key) => key + 1);
+      setRequestKey((key) => key + 1);
+    }
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters]);
+
+  const dropSession = useCallback((sessionId, close = true) => {
+    const rows = sessionsRef.current.filter((session) => session.id !== sessionId);
+    sessionsRef.current = rows;
+    setSessions(rows);
+    setSelectedIds((current) => { const next = new Set(current); next.delete(sessionId); return next; });
+    if (close) closeDetail();
   }, [closeDetail]);
 
   const renameSession = useCallback(async (sessionId, title) => {
@@ -668,8 +941,9 @@ function App() {
     if (!response.ok) throw new Error(result.error || '세션 제목을 변경하지 못했습니다.');
 
     applySessionUpdate(sessionId, result.session);
+    void reconcile(resultCountRef.current);
     return result.session;
-  }, [applySessionUpdate]);
+  }, [applySessionUpdate, reconcile]);
 
   const deleteSession = useCallback(async (sessionId) => {
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
@@ -678,14 +952,23 @@ function App() {
       body: JSON.stringify({ confirm: sessionId }),
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || '세션을 삭제하지 못했습니다.');
+    if (!response.ok) {
+      const deleteError = new Error(result.error || '세션을 삭제하지 못했습니다.');
+      Object.assign(deleteError, result);
+      if (result.code === 'partial_delete' || result.code === 'delete_failed') {
+        setPanelResetKey((key) => key + 1);
+        setRequestKey((key) => key + 1);
+      }
+      throw deleteError;
+    }
 
     dropSession(sessionId);
-    // 통계와 상태 숫자는 서버가 현재 조건으로 다시 계산해야 맞는다.
+    setPanelResetKey((key) => key + 1);
     setRequestKey((key) => key + 1);
+    requestAnimationFrame(() => resultsHeadingRef.current?.focus());
   }, [dropSession]);
 
-  const setSessionStatus = useCallback(async (sessionId, next, previous) => {
+  const setSessionStatus = useCallback(async (sessionId, next) => {
     const response = await fetch(`/api/status/${encodeURIComponent(sessionId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -695,18 +978,105 @@ function App() {
     if (!response.ok) throw new Error(result.error || '상태를 변경하지 못했습니다.');
 
     // 걸러보는 상태 밖으로 나가면 목록에서 빠진다.
-    if (statusFilters.length && !statusFilters.includes(result.session.status)) dropSession(sessionId);
+    const visible = sessionsRef.current.some((session) => session.id === sessionId);
+    const expectedCount = statusFilters.length && !statusFilters.includes(result.session.status) ? resultCountRef.current - 1 : resultCountRef.current;
+    if (statusFilters.length && !statusFilters.includes(result.session.status)) dropSession(sessionId, false);
     else applySessionUpdate(sessionId, result.session);
-    setStatusCounts((current) => ({
-      ...current,
-      [previous]: Math.max(0, current[previous] - 1),
-      [next]: current[next] + 1,
-    }));
-  }, [statusFilters, applySessionUpdate, dropSession]);
+    if (visible) void reconcile(expectedCount);
+    else setRequestKey((key) => key + 1);
+  }, [statusFilters, applySessionUpdate, dropSession, reconcile]);
+
+  const archiveSession = useCallback(async (session, archived, origin) => {
+    const response = await fetch(`/api/archive/${encodeURIComponent(session.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      const archiveError = new Error(result.error || '보관 상태를 변경하지 못했습니다.');
+      setError(archiveError.message);
+      throw archiveError;
+    }
+    const visible = sessionsRef.current.some((row) => row.id === session.id);
+    if (origin === 'model' || !visible || !result.changed) {
+      setRequestKey((key) => key + 1);
+      return;
+    }
+    if (archiveView === 'current' && archived) {
+      dropSession(session.id, origin === 'detail');
+      setUndo({ session, expiresAt: Date.now() + 30000 });
+      requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
+      resultCountRef.current -= 1;
+      void reconcile(resultCountRef.current);
+    } else if (archiveView === 'archived' && !archived) {
+      dropSession(session.id, origin === 'detail');
+      resultCountRef.current -= 1;
+      void reconcile(resultCountRef.current);
+    } else {
+      applySessionUpdate(session.id, result.session);
+      void reconcile(resultCountRef.current);
+    }
+  }, [applySessionUpdate, archiveView, dropSession, reconcile]);
+
+  const undoArchive = useCallback(async () => {
+    if (!undo || undoSubmittingRef.current) return;
+    undoSubmittingRef.current = true;
+    setUndoSubmitting(true);
+    try {
+      await archiveSession(undo.session, false, 'undo');
+      setUndo(null);
+      setPanelResetKey((key) => key + 1);
+      setRequestKey((key) => key + 1);
+      requestAnimationFrame(() => resultsHeadingRef.current?.focus());
+    } catch (undoError) {
+      setError(undoError.message);
+    } finally {
+      undoSubmittingRef.current = false;
+      setUndoSubmitting(false);
+    }
+  }, [archiveSession, undo]);
+
+  useEffect(() => {
+    if (!undo || undoSubmitting) return undefined;
+    const timer = setTimeout(() => setUndo(null), Math.max(0, undo.expiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [undo, undoSubmitting]);
 
   const refresh = () => {
     forceRefresh.current = true;
+    setPanelResetKey((key) => key + 1);
     setRequestKey((key) => key + 1);
+  };
+
+  const toggleSelected = useCallback((id) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const archiveSelected = async () => {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    setBulkSubmitting(true);
+    try {
+      const response = await fetch('/api/archive', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, archived: true }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '선택한 세션을 보관하지 못했습니다.');
+      const outcomes = result.results.reduce((counts, item) => ({ ...counts, [item.outcome]: (counts[item.outcome] || 0) + 1 }), {});
+      setAnnouncement(`보관 완료: 변경 ${outcomes.changed || 0}개, 유지 ${outcomes.noop || 0}개, 찾지 못함 ${outcomes.not_found || 0}개`);
+      setBulkConfirming(false);
+      setSelectedIds(new Set());
+      setPanelResetKey((key) => key + 1);
+      setRequestKey((key) => key + 1);
+      requestAnimationFrame(() => resultsHeadingRef.current?.focus());
+    } catch (batchError) {
+      setError(batchError.message);
+    } finally {
+      setBulkSubmitting(false);
+    }
   };
 
   const addDirectory = async (event) => {
@@ -719,6 +1089,7 @@ function App() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || '폴더를 추가하지 못했습니다.');
       setDirectory('');
+      setPanelResetKey((key) => key + 1);
       setRequestKey((key) => key + 1);
     } catch (addError) {
       setDirectoryError(addError.message);
@@ -765,10 +1136,11 @@ function App() {
           <div><span>토큰</span><strong>{summary?.totalTokens ? number.format(summary.totalTokens) : '—'}</strong></div>
           <div><span>비용</span><strong>{summary?.totalCost ? money.format(summary.totalCost) : '—'}</strong></div>
         </section>
+        <p className="archive-readout">기간 합계 · 보관 포함 · {summary?.archivedSessionCount ? <button type="button" onClick={() => { setArchiveView('archived'); requestAnimationFrame(() => resultsHeadingRef.current?.focus()); }}>보관된 세션 {number.format(summary.archivedSessionCount)}개 보기</button> : '보관된 세션 없음'}</p>
 
         {summary?.indexing ? <div className="index-progress" role="status"><span style={{ width: `${progress}%` }} /><p>목록 사용 가능 · 대화 검색 인덱스 {number.format(summary.indexedCount)}/{number.format(summary.totalCount)}</p></div> : null}
 
-        <ModelUsage models={summary?.models || []} totalTokens={summary?.totalTokens || 0} scopeLabel={periodLabel} />
+        <ModelUsage models={summary?.models || []} totalTokens={summary?.totalTokens || 0} scopeLabel={periodLabel} period={period} customFrom={customFrom} customTo={customTo} revision={modelRevision} panelResetKey={panelResetKey} onArchive={archiveSession} />
 
         <div className="workspace">
           <aside className="filters">
@@ -789,6 +1161,11 @@ function App() {
                   </button>
                 ))}
               </div>
+              <fieldset className="archive-filters"><legend>보관 상태</legend>
+                <label><input type="radio" name="archive-view" checked={archiveView === 'current'} onChange={() => setArchiveView('current')} />현재 세션 <strong>{number.format(archiveCounts.current || 0)}</strong></label>
+                <label><input type="radio" name="archive-view" checked={archiveView === 'archived'} onChange={() => setArchiveView('archived')} />보관됨 <strong>{number.format(archiveCounts.archived || 0)}</strong></label>
+                <label><input type="radio" name="archive-view" checked={archiveView === 'all'} onChange={() => setArchiveView('all')} />모두 보기</label>
+              </fieldset>
               <p className="scope-note">{statusFilters.length ? '고른 상태만 보입니다.' : '상태를 고르지 않으면 전부 보입니다.'}</p>
               <label>
                 <span>기간</span>
@@ -834,7 +1211,11 @@ function App() {
           </aside>
 
           <section className="session-index" aria-busy={loading}>
-            <header className="results-heading"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><span>{scopeLabel} · 최근 활동순</span></header>
+            <header className="results-heading" ref={resultsHeadingRef} tabIndex="-1"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><label>정렬 <span className="select-shell"><select value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">최근 활동순</option><option value="tokens">토큰 많은순</option><option value="cost">비용 높은순</option></select></span></label></header>
+            {undo ? <div className="archive-undo" role="status">보관됨 · <button ref={undoRef} type="button" onClick={() => void undoArchive()} disabled={undoSubmitting}>{undoSubmitting ? '복원 중' : '되돌리기'}</button></div> : null}
+            <div className="bulk-bar"><label><input type="checkbox" disabled={bulkSubmitting} checked={sessions.length > 0 && selectedIds.size === sessions.length} onChange={() => setSelectedIds(selectedIds.size === sessions.length ? new Set() : new Set(sessions.map((session) => session.id)))} /> 불러온 행 모두 선택</label>{selectedIds.size ? <button type="button" disabled={bulkSubmitting} onClick={() => setBulkConfirming(true)} aria-expanded={bulkConfirming} aria-controls="bulk-confirmation">선택한 {number.format(selectedIds.size)}개 보관</button> : null}</div>
+            {bulkConfirming ? <section id="bulk-confirmation" className="bulk-confirm" aria-label="일괄 보관 확인"><p role="status">선택한 {number.format(selectedIds.size)}개 세션을 보관합니다</p><button type="button" onClick={() => setBulkConfirming(false)} disabled={bulkSubmitting}>취소</button><button type="button" onClick={() => void archiveSelected()} disabled={bulkSubmitting}>{bulkSubmitting ? '보관 중' : '보관'}</button></section> : null}
+            <p className="sr-only" role="status">{announcement}</p>
             {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
             {!error && !loading && sessions.length === 0 ? <div className="empty-state">{`${scopeLabel}에 해당하는 세션이 없습니다.`}</div> : null}
@@ -843,7 +1224,7 @@ function App() {
                 const session = sessions[virtualRow.index];
                 return (
                   <div key={virtualRow.key} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} className="virtual-row" style={{ transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)` }}>
-                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} />
+                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} onArchive={archiveSession} selected={selectedIds.has(session.id)} onSelect={toggleSelected} />
                   </div>
                 );
               })}
@@ -858,7 +1239,7 @@ function App() {
       </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
-      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} />
+      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onArchive={archiveSession} />
     </div>
   );
 }
