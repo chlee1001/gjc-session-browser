@@ -38,6 +38,8 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
   const entries = [
     { type: 'session', version: 4, id: sessionId, timestamp: '2026-08-10T01:00:00.000Z', cwd: home, title: '변경 전 제목' },
     { type: 'message', id: 'c5307ea4-1e48-4bf7-a2a7-9da1be2762ee', parentId: null, timestamp: '2026-08-10T01:01:00.000Z', message: { role: 'user', content: [{ type: 'text', text: '통합 테스트' }] } },
+    { type: 'message', id: 'a1b2c3d4-0000-4000-8000-000000000001', parentId: 'c5307ea4-1e48-4bf7-a2a7-9da1be2762ee', timestamp: '2026-08-10T01:02:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: '확인했습니다.' }], provider: 'anthropic', model: 'claude-test', usage: { totalTokens: 120, cost: { total: 0.5 } } } },
+    { type: 'message', id: 'a1b2c3d4-0000-4000-8000-000000000002', parentId: 'a1b2c3d4-0000-4000-8000-000000000001', timestamp: '2026-08-10T01:03:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: '마저 했습니다.' }], provider: 'openai', model: 'gpt-test', usage: { totalTokens: 80, cost: { total: 0.25 } } } },
   ];
   await mkdir(path.join(sessionDirectory, 'session'), { recursive: true });
   await writeFile(sessionFile, `${entries.map(JSON.stringify).join('\n')}\n`);
@@ -67,6 +69,11 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
     }
     assert.equal(listing.summary.indexing, false, diagnostics);
     assert.equal(listing.sessions[0].id, sessionId);
+    assert.equal(listing.summary.totalTokens, 200);
+    assert.deepEqual(listing.summary.models, [
+      { id: 'anthropic/claude-test', sessions: 1, responses: 1, tokens: 120, cost: 0.5 },
+      { id: 'openai/gpt-test', sessions: 1, responses: 1, tokens: 80, cost: 0.25 },
+    ], '기간 통계의 토큰은 모델별로도 나뉘어 나온다');
 
     const setStatus = async (status) => {
       const response = await fetch(`${baseUrl}/api/status/${sessionId}`, {

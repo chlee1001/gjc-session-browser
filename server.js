@@ -12,7 +12,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const agentDirectory = process.env.GJC_CODING_AGENT_DIR || path.join(homedir(), '.gjc', 'agent');
 const defaultSessionDirectory = path.join(agentDirectory, 'sessions');
 const configPath = path.join(homedir(), '.gjc', 'session-list.json');
-const cachePath = path.join(homedir(), '.cache', 'gjc-session-list', 'index-v2.json.gz');
+const cachePath = path.join(homedir(), '.cache', 'gjc-session-list', 'index-v4.json.gz');
 const port = Number(process.env.PORT) || 4175;
 const isProduction = process.env.NODE_ENV === 'production';
 const cliDirectories = process.argv.flatMap((argument, index, all) => argument === '--session-dir' ? [all[index + 1]] : []);
@@ -185,6 +185,7 @@ function sendJson(response, statusCode, value) {
 
 function getSummary(sessions) {
   const folders = new Map();
+  const models = new Map();
   let totalMessages = 0;
   let totalTokens = 0;
   let totalCost = 0;
@@ -194,6 +195,14 @@ function getSummary(sessions) {
     totalTokens += session.totalTokens;
     totalCost += session.cost;
     if (session.cwd) folders.set(session.cwd, (folders.get(session.cwd) || 0) + 1);
+    for (const usage of session.models) {
+      const bucket = models.get(usage.id) || { id: usage.id, sessions: 0, responses: 0, tokens: 0, cost: 0 };
+      bucket.sessions += 1;
+      bucket.responses += usage.responses;
+      bucket.tokens += usage.tokens;
+      bucket.cost += usage.cost;
+      models.set(usage.id, bucket);
+    }
   }
 
   return {
@@ -210,6 +219,7 @@ function getSummary(sessions) {
     folders: [...folders.entries()]
       .map(([cwd, count]) => ({ cwd, name: path.basename(cwd), count }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
+    models: [...models.values()].sort((a, b) => b.tokens - a.tokens || a.id.localeCompare(b.id)),
   };
 }
 

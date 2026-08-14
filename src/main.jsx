@@ -17,6 +17,7 @@ const PERIODS = [
 ];
 const number = new Intl.NumberFormat('ko-KR');
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const percent = new Intl.NumberFormat('ko-KR', { style: 'percent', maximumFractionDigits: 1 });
 const relativeTime = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
 
 function formatRelative(iso) {
@@ -130,8 +131,50 @@ function lockBodyScroll() {
   return () => { document.body.style.overflow = previousOverflow; };
 }
 
+/** 기간 통계의 토큰을 응답에 적힌 모델로 쪼개 보여 준다. 한 세션이 여러 모델에 걸치므로 모델별 세션 수를 더하면 전체 세션 수보다 클 수 있다. */
+function ModelUsage({ models, totalTokens, scopeLabel }) {
+  const [open, setOpen] = useState(true);
+
+  return (
+    <section className="model-usage" aria-label="모델별 사용량">
+      <header>
+        <div><h2>모델별 사용량</h2><p>{scopeLabel} · 응답에 기록된 모델 기준 · 서브에이전트 포함</p></div>
+        <button type="button" aria-expanded={open} aria-controls="model-usage-body" onClick={() => setOpen((value) => !value)}>
+          {open ? '접기' : `모델 ${number.format(models.length)}개 펼치기`}
+        </button>
+      </header>
+      <div id="model-usage-body" hidden={!open}>
+        {models.length === 0 ? <p className="model-empty">이 기간에는 집계된 토큰 사용량이 없습니다.</p> : (
+          <ol className="model-list">
+            {models.map((item) => {
+              const { vendor, name } = splitModel(item.id);
+              const share = totalTokens ? item.tokens / totalTokens : 0;
+              return (
+                <li key={item.id}>
+                  <div className="model-label" title={item.id || undefined}>
+                    <span>{vendor || '모델'}</span><strong>{name || '정보 없음'}</strong>
+                  </div>
+                  <div className="model-share"><i style={{ width: `${(share * 100).toFixed(2)}%` }} /></div>
+                  <dl className="model-figures">
+                    <div><dt>토큰</dt><dd>{number.format(item.tokens)}</dd></div>
+                    <div><dt>비중</dt><dd>{percent.format(share)}</dd></div>
+                    <div><dt>비용</dt><dd>{money.format(item.cost)}</dd></div>
+                    <div><dt>응답</dt><dd>{number.format(item.responses)}</dd></div>
+                    <div><dt>세션</dt><dd>{number.format(item.sessions)}</dd></div>
+                  </dl>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
+    </section>
+  );
+}
+
 const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
-  const model = splitModel(session.model);
+  // 세션 헤더의 모델은 마지막으로 고른 하나라 실제로 쓴 모델을 대표하지 못한다. 토큰을 가장 많이 쓴 쪽을 앞에 세운다.
+  const model = splitModel(session.models[0]?.id || session.model);
   return (
     <article className={`session-row is-${session.status}`} id={`session-${session.id}`}>
       <button className="session-open" type="button" onClick={() => onOpen(session)} aria-label={`${session.title} 상세 정보 열기`}>
@@ -153,9 +196,9 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus }) {
           <div><dt>비용</dt><dd>{session.cost ? money.format(session.cost) : '—'}</dd></div>
           <div><dt>파일</dt><dd>{formatBytes(session.size)}</dd></div>
         </dl>
-        <div className="session-model" title={session.model || undefined}>
+        <div className="session-model" title={session.models.map((item) => `${item.id} ${number.format(item.tokens)}`).join('\n') || session.model || undefined}>
           <span>{model.vendor || '모델'}</span>
-          <strong>{model.name || '정보 없음'}</strong>
+          <strong>{model.name || '정보 없음'}{session.models.length > 1 ? <em>외 {session.models.length - 1}</em> : null}</strong>
         </div>
       </button>
       <div className="session-status">
@@ -343,7 +386,22 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
               <div><dt>최근 활동</dt><dd>{new Date(session.lastActivity).toLocaleString('ko-KR')}</dd></div>
               <div><dt>메시지</dt><dd>{number.format(session.messageCount)}</dd></div>
               <div><dt>토큰 · 비용</dt><dd>{number.format(session.totalTokens)} · {money.format(session.cost)}</dd></div>
+              <div><dt>서브에이전트 몫</dt><dd>{session.subagentTokens ? `${number.format(session.subagentTokens)} · ${money.format(session.subagentCost)}` : '없음'}</dd></div>
             </dl>
+
+            {session.models.length > 0 ? (
+              <section className="detail-models">
+                <h3>모델별 사용량</h3>
+                <ul>
+                  {session.models.map((item) => (
+                    <li key={item.id}>
+                      <code>{item.id || '정보 없음'}</code>
+                      <span>{number.format(item.tokens)} 토큰 · {money.format(item.cost)} · 응답 {number.format(item.responses)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
 
             <section className="exchange">
               <h3>마지막 대화</h3>
@@ -709,6 +767,8 @@ function App() {
         </section>
 
         {summary?.indexing ? <div className="index-progress" role="status"><span style={{ width: `${progress}%` }} /><p>목록 사용 가능 · 대화 검색 인덱스 {number.format(summary.indexedCount)}/{number.format(summary.totalCount)}</p></div> : null}
+
+        <ModelUsage models={summary?.models || []} totalTokens={summary?.totalTokens || 0} scopeLabel={periodLabel} />
 
         <div className="workspace">
           <aside className="filters">

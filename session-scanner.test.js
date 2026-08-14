@@ -33,7 +33,76 @@ test('세션 메타데이터와 사용량을 JSONL에서 읽는다', async () =>
     assert.equal(session.messageCount, 2);
     assert.equal(session.totalTokens, 42);
     assert.equal(session.cost, 0.25);
+    assert.deepEqual(session.models, [{ id: 'openai/gpt-test', responses: 1, tokens: 42, cost: 0.25 }], '모델이 안 적힌 응답은 그 시점 세션 모델로 잡는다');
     assert.match(session.preview, /고유한 검색어/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('모델을 갈아탄 세션의 사용량을 응답에 적힌 모델별로 나눈다', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'gjc-models-'));
+  const file = path.join(directory, 'session.jsonl');
+  const answer = (timestamp, provider, model, totalTokens, total) => ({
+    type: 'message',
+    timestamp,
+    message: { role: 'assistant', content: [{ type: 'text', text: '응답' }], provider, model, usage: { totalTokens, cost: { total } } },
+  });
+  const mixed = [
+    entries[0],
+    entries[1],
+    answer('2026-08-10T01:02:00.000Z', 'anthropic', 'claude-test', 100, 1),
+    { type: 'model_change', timestamp: '2026-08-10T01:03:00.000Z', model: 'openai-codex/gpt-test-2' },
+    answer('2026-08-10T01:04:00.000Z', 'openai-codex', 'gpt-test-2', 300, 2),
+    answer('2026-08-10T01:05:00.000Z', 'anthropic', 'claude-test', 50, 0.5),
+  ];
+  await writeFile(file, mixed.map(JSON.stringify).join('\n'));
+
+  try {
+    const session = await parseSessionFile(file);
+    assert.equal(session.totalTokens, 450);
+    assert.deepEqual(session.models, [
+      { id: 'openai-codex/gpt-test-2', responses: 1, tokens: 300, cost: 2 },
+      { id: 'anthropic/claude-test', responses: 2, tokens: 150, cost: 1.5 },
+    ], '같은 모델은 합치고 토큰이 많은 쪽이 앞에 온다');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('서브에이전트 전사본의 사용량을 부모 세션에 합산한다', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'gjc-subagent-'));
+  const file = path.join(directory, 'session.jsonl');
+  const artifacts = path.join(directory, 'session');
+  const nested = path.join(artifacts, '0-Planner');
+  await mkdir(nested, { recursive: true });
+  await writeFile(file, entries.map(JSON.stringify).join('\n'));
+  // 서브에이전트 전사본은 그 자체가 세션 파일 모양이고, 서브에이전트가 또 부른 것은 한 단 더 중첩된다.
+  const transcript = (id, model, totalTokens, total) => [
+    { type: 'session', id, timestamp: '2026-08-10T01:03:00.000Z', cwd: '/work/alpha', title: id },
+    { type: 'message', timestamp: '2026-08-10T01:04:00.000Z', message: { role: 'assistant', content: [{ type: 'text', text: '서브 응답' }], provider: 'anthropic', model, usage: { totalTokens, cost: { total } } } },
+  ].map(JSON.stringify).join('\n');
+  await writeFile(path.join(artifacts, '0-Planner.jsonl'), transcript('sub-1', 'claude-sonnet-test', 700, 0.7));
+  await writeFile(path.join(nested, 'deep.jsonl'), transcript('sub-2', 'claude-sonnet-test', 300, 0.3));
+
+  try {
+    const session = await parseSessionFile(file);
+    assert.equal(session.subagentTokens, 1000);
+    assert.equal(session.totalTokens, 1042, '본문 42 + 서브에이전트 1000');
+    assert.equal(session.messageCount, 2, '서브에이전트 메시지는 대화 길이를 부풀리지 않는다');
+    assert.deepEqual(session.models, [
+      { id: 'anthropic/claude-sonnet-test', responses: 2, tokens: 1000, cost: 1 },
+      { id: 'openai/gpt-test', responses: 1, tokens: 42, cost: 0.25 },
+    ]);
+    assert.equal(session.searchText.includes('서브 응답'), false, '전사본 본문은 검색 인덱스에 넣지 않는다');
+    assert.equal(filterSessions([session], { query: 'claude-sonnet-test' }).length, 1, '서브에이전트 전용 모델도 이름으로 찾힌다');
+
+    // 세션 파일은 그대로인데 서브에이전트만 길어진 경우도 다시 읽어야 한다.
+    const fresh = await discoverSessions([directory], [session]);
+    assert.equal(fresh.pendingFiles.length, 0, '그대로면 재인덱싱하지 않는다');
+    await writeFile(path.join(artifacts, '1-Critic.jsonl'), transcript('sub-3', 'claude-sonnet-test', 5, 0.05));
+    const stale = await discoverSessions([directory], [session]);
+    assert.deepEqual(stale.pendingFiles, [file], '전사본이 늘어나면 캐시를 버린다');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -114,6 +183,29 @@ test('header_patch로 변경된 제목을 목록과 상세 조회에 반영한�
     const [session, detail] = await Promise.all([parseSessionFile(file), parseSessionDetail(file)]);
     assert.equal(session.title, '변경된 세션 제목');
     assert.equal(detail.title, '변경된 세션 제목');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('같은 세션이 두 저장소에 남아 있으면 최근 사본만 목록에 올린다', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'gjc-migrated-'));
+  const legacy = path.join(directory, '-Users-me-project');
+  const current = path.join(directory, 'v2-hashed');
+  await mkdir(legacy, { recursive: true });
+  await mkdir(current, { recursive: true });
+  // 마이그레이션 전후 사본. 신형 쪽에 대화가 더 쌓여 있다.
+  await writeFile(path.join(legacy, 'session.jsonl'), entries.map(JSON.stringify).join('\n'));
+  await writeFile(path.join(current, 'session.jsonl'), [
+    ...entries,
+    { type: 'message', timestamp: '2026-08-10T02:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text: '이어서' }] } },
+  ].map(JSON.stringify).join('\n'));
+
+  try {
+    const { sessions, pendingFiles } = await discoverSessions([directory]);
+    assert.equal(sessions.length, 1, '같은 id는 한 줄만 남는다');
+    assert.equal(sessions[0].filePath, path.join(current, 'session.jsonl'), '최근 활동이 늦은 사본을 고른다');
+    assert.deepEqual(pendingFiles, [path.join(current, 'session.jsonl')], '버린 사본은 인덱싱하지 않는다');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
