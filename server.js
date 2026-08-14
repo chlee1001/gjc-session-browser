@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { execFile as execFileCallback } from 'node:child_process';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -24,6 +25,11 @@ let customDirectories = [];
 const STATUS_VALUES = ['none', 'active', 'done'];
 let sessionStatus = new Map();
 let sessionMap = new Map();
+let sessionCopyPathsById = new Map();
+let archivedSessionIds = new Set();
+let pendingDeletePairs = new Map();
+let modelRevision = randomUUID();
+let configQueue = Promise.resolve();
 let initialized = false;
 let initializePromise = null;
 let generation = 0;
@@ -60,6 +66,11 @@ async function loadDirectories() {
   for (const [id, value] of Object.entries(config.sessionStatus || {})) {
     if (value === 'active' || value === 'done') sessionStatus.set(id, value);
   }
+  archivedSessionIds = new Set(
+    Array.isArray(config.archivedSessionIds)
+      ? config.archivedSessionIds.filter((id) => typeof id === 'string' && id.length > 0)
+      : [],
+  );
 }
 
 function configuredDirectories() {
@@ -75,12 +86,56 @@ function configuredDirectories() {
   ].filter(Boolean).map(expandHome))];
 }
 
-async function saveConfig() {
+function configJson(draft) {
+  return JSON.stringify({
+    directories: draft.directories,
+    sessionStatus: Object.fromEntries(draft.sessionStatus),
+    archivedSessionIds: [...draft.archivedSessionIds].sort(),
+  }, null, 2);
+}
+
+async function writeConfig(draft) {
   await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, JSON.stringify({
-    directories: customDirectories,
-    sessionStatus: Object.fromEntries(sessionStatus),
-  }, null, 2));
+  const temporaryPath = `${configPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, configJson(draft));
+    await rename(temporaryPath, configPath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function rotateRevision() {
+  modelRevision = randomUUID();
+}
+
+function committedDraft() {
+  return {
+    directories: [...customDirectories],
+    sessionStatus: new Map(sessionStatus),
+    archivedSessionIds: new Set(archivedSessionIds),
+  };
+}
+
+function publishConfig(draft, rotate) {
+  customDirectories = draft.directories;
+  sessionStatus = draft.sessionStatus;
+  archivedSessionIds = draft.archivedSessionIds;
+  if (rotate) rotateRevision();
+}
+
+function mutateConfig(mutator) {
+  const work = configQueue.then(async () => {
+    const draft = committedDraft();
+    const outcome = await mutator(draft);
+    if (!outcome.changed) return outcome;
+    await writeConfig(draft);
+    publishConfig(draft, outcome.rotate !== false);
+    return outcome;
+  });
+  configQueue = work.catch(() => {});
+  return work;
 }
 
 async function saveCache(currentGeneration) {
@@ -94,10 +149,12 @@ async function saveCache(currentGeneration) {
 
 async function refreshIndex(cachedSessions) {
   const currentGeneration = ++generation;
-  const { sessions, pendingFiles } = await discoverSessions(configuredDirectories(), cachedSessions);
+  const { sessions, pendingFiles, copyPathsById } = await discoverSessions(configuredDirectories(), cachedSessions);
   if (currentGeneration !== generation) return;
 
-  sessionMap = new Map(sessions.map((session) => [session.filePath, session]));
+  sessionMap = new Map(sessions.map((session) => [session.id, session]));
+  sessionCopyPathsById = copyPathsById;
+  rotateRevision();
   status = {
     indexing: pendingFiles.length > 0,
     indexedCount: sessions.length - pendingFiles.length,
@@ -109,12 +166,13 @@ async function refreshIndex(cachedSessions) {
   if (pendingFiles.length > 0) {
     void indexSessionFiles(pendingFiles, (session) => {
       if (currentGeneration !== generation) return;
-      sessionMap.set(session.filePath, session);
+      sessionMap.set(session.id, session);
       status.indexedCount += 1;
     }).then(async () => {
       if (currentGeneration !== generation) return;
       status.indexedCount = status.totalCount;
       await saveCache(currentGeneration);
+      rotateRevision();
       status.indexing = false;
     });
   } else {
@@ -137,7 +195,8 @@ async function initializeIndex(force = false) {
 
     const cached = await readCache();
     if (cached.length > 0) {
-      sessionMap = new Map(cached.map((session) => [session.filePath, session]));
+      sessionMap = new Map(cached.map((session) => [session.id, session]));
+      sessionCopyPathsById = new Map(cached.map((session) => [session.id, [session.filePath]]));
       status = {
         indexing: true,
         indexedCount: cached.length,
@@ -160,10 +219,7 @@ function sessionsSorted() {
 }
 
 function findSessionById(sessionId) {
-  for (const session of sessionMap.values()) {
-    if (session.id === sessionId) return session;
-  }
-  return undefined;
+  return sessionMap.get(sessionId);
 }
 
 function persistCache() {
@@ -171,7 +227,11 @@ function persistCache() {
 }
 
 function publicSessionWithState(session) {
-  return { ...publicSession(session), status: sessionStatus.get(session.id) || 'none' };
+  return {
+    ...publicSession(session),
+    status: sessionStatus.get(session.id) || 'none',
+    archived: archivedSessionIds.has(session.id),
+  };
 }
 
 function sendJson(response, statusCode, value) {
@@ -192,8 +252,6 @@ function getSummary(sessions) {
 
   for (const session of sessions) {
     totalMessages += session.messageCount;
-    totalTokens += session.totalTokens;
-    totalCost += session.cost;
     if (session.cwd) folders.set(session.cwd, (folders.get(session.cwd) || 0) + 1);
     for (const usage of session.models) {
       const bucket = models.get(usage.id) || { id: usage.id, sessions: 0, responses: 0, tokens: 0, cost: 0 };
@@ -203,6 +261,10 @@ function getSummary(sessions) {
       bucket.cost += usage.cost;
       models.set(usage.id, bucket);
     }
+  }
+  for (const bucket of models.values()) {
+    totalTokens += bucket.tokens;
+    totalCost += bucket.cost;
   }
 
   return {
@@ -216,6 +278,8 @@ function getSummary(sessions) {
     indexing: status.indexing,
     indexedCount: status.indexedCount,
     totalCount: status.totalCount,
+    archivedSessionCount: sessions.filter((session) => archivedSessionIds.has(session.id)).length,
+    modelRevision,
     folders: [...folders.entries()]
       .map(([cwd, count]) => ({ cwd, name: path.basename(cwd), count }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
@@ -224,12 +288,18 @@ function getSummary(sessions) {
 }
 
 async function readBody(request) {
-  let body = '';
+  const chunks = [];
+  let bytes = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (body.length > 10_000) throw new Error('요청이 너무 큽니다.');
+    bytes += chunk.length;
+    if (bytes > 8_000) {
+      const error = new Error('Request body too large.');
+      error.code = 'body_too_large';
+      throw error;
+    }
+    chunks.push(chunk);
   }
-  return JSON.parse(body || '{}');
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
 
 function sessionRootFor(filePath) {
@@ -268,6 +338,10 @@ function gjcModuleUrl(packageDirectory, moduleName) {
   return pathToFileURL(path.join(packageDirectory, 'src', 'session', moduleName)).href;
 }
 
+function gjcNativeModuleUrl(packageDirectory) {
+  return pathToFileURL(path.join(path.dirname(packageDirectory), 'natives', 'native', 'index.js')).href;
+}
+
 /**
  * Run one Bun script against the installed GJC session modules. Inputs travel as env, never as source text.
  * 실패하면 스크립트 본문이 통째로 담긴 셸 오류 대신 GJC가 던진 문장만 남긴다.
@@ -282,6 +356,39 @@ async function runGjcScript(script, env) {
   } catch (error) {
     const reason = /^\s*(?:\[Uncaught Exception\]\s*)?(?:\w*Error): (.+)$/m.exec(error.stderr || '');
     throw new Error(reason ? reason[1].trim() : 'GJC 세션 작업이 실패했습니다.');
+  }
+}
+
+async function managedPathsReadOnly(entries) {
+  if (entries.length === 0) return new Set();
+  const packageDirectory = await resolveGjcPackageDirectory();
+  const script = `
+    const { SessionManager } = await import(process.env.GJC_MANAGER_URL);
+    const entries = JSON.parse(process.env.GJC_MANAGED_ENTRIES);
+    const authorized = [];
+    for (const entry of entries) {
+      const sessions = await SessionManager.listManagedForResumePickerReadOnly(
+        entry.cwd, process.env.GJC_AGENT_DIR,
+      );
+      if (sessions.some((session) => session.path === entry.sourcePath)) authorized.push(entry.sourcePath);
+    }
+    process.stdout.write(JSON.stringify(authorized));
+  `;
+  try {
+    const { stdout } = await runFile('bun', ['-e', script], {
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      env: {
+        ...process.env,
+        GJC_MANAGED_ENTRIES: JSON.stringify(entries),
+        GJC_AGENT_DIR: agentDirectory,
+        GJC_MANAGER_URL: gjcModuleUrl(packageDirectory, 'session-manager.ts'),
+      },
+    });
+    return new Set(JSON.parse(stdout));
+  } catch {
+    // Read-only inventory failures grant no deletion authority.
+    return new Set();
   }
 }
 
@@ -326,22 +433,7 @@ async function deleteStoredSession(session) {
       await new FileSessionStorage().deleteSessionWithArtifacts(target);
     } else {
       const { SessionManager } = await import(process.env.GJC_MANAGER_URL);
-      // GJC가 이 파일에 대한 관리 권한을 세우지 못하는 경우다. 작업 폴더가 사라졌거나
-      // 관리 후보 목록에 없을 때인데, 지킬 관리 상태가 없으므로 전사본과 아티팩트만
-      // 지운다. 삭제 범위는 그 세션 파일과 동명 디렉터리로 한정된다.
-      // 그 외 실패(마이그레이션 잠금, 입출력)는 그대로 올린다.
-      const AUTHORITY_REFUSALS = [
-        'Could not resolve managed session scope',
-        'Session is not an authorized managed candidate',
-        'Managed session scan did not grant deletion authority',
-      ];
-      try {
-        await SessionManager.deleteManagedCandidate(target);
-      } catch (error) {
-        const message = String(error?.message ?? '');
-        if (!AUTHORITY_REFUSALS.some((refusal) => message.includes(refusal))) throw error;
-        await new FileSessionStorage().deleteSessionWithArtifacts(target);
-      }
+      await SessionManager.deleteManagedCandidate(target);
     }
   `;
   await runGjcScript(script, {
@@ -351,6 +443,250 @@ async function deleteStoredSession(session) {
     GJC_MANAGER_URL: gjcModuleUrl(packageDirectory, 'session-manager.ts'),
     GJC_STORAGE_URL: gjcModuleUrl(packageDirectory, 'session-storage.ts'),
   });
+}
+
+async function deleteAuthorizedArtifactOnly(pair) {
+  if (sessionRootFor(pair.sourcePath) !== path.resolve(defaultSessionDirectory)
+    || pair.artifactPath !== artifactPathFor(pair.sourcePath)
+    || pair.managedAuthorized !== true) {
+    throw deletionError('delete_preflight_failed', '승인되지 않은 아티팩트 삭제입니다.');
+  }
+  if (!pair.managedArtifactSnapshot) throw deletionError('delete_preflight_failed', '보관된 아티팩트 식별 정보가 없습니다.');
+  const packageDirectory = await resolveGjcPackageDirectory();
+  const script = `
+    const { openRecoveryFsRoot } = await import(process.env.GJC_NATIVE_URL);
+    const authority = openRecoveryFsRoot(process.env.GJC_ARTIFACT_ROOT);
+    try {
+      const removed = authority.removeManagedTree(process.env.GJC_ARTIFACT_RELATIVE, JSON.parse(process.env.GJC_ARTIFACT_SNAPSHOT));
+      if (!removed.ok && removed.code !== "not_found") throw new Error(removed.code ?? "managed_artifact_remove_failed");
+    } finally {
+      const closed = authority.close();
+      if (!closed.ok) throw new Error(closed.code ?? "managed_artifact_authority_close_failed");
+    }
+  `;
+  await runGjcScript(script, {
+    GJC_ARTIFACT_ROOT: path.dirname(pair.sourcePath),
+    GJC_ARTIFACT_RELATIVE: path.basename(pair.artifactPath),
+    GJC_ARTIFACT_SNAPSHOT: JSON.stringify(pair.managedArtifactSnapshot),
+    GJC_NATIVE_URL: gjcNativeModuleUrl(packageDirectory),
+  });
+}
+
+function artifactPathFor(sourcePath) {
+  return sourcePath.endsWith('.jsonl') ? sourcePath.slice(0, -'.jsonl'.length) : '';
+}
+
+async function pairAuthority(pair) {
+  const root = sessionRootFor(pair.sourcePath);
+  if (!root || pair.artifactPath !== artifactPathFor(pair.sourcePath)) return { authorized: false, reason: 'not_authorized' };
+  try {
+    const source = await stat(pair.sourcePath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    const artifact = await stat(pair.artifactPath).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (source && !source.isFile()) return { authorized: false, reason: 'invalid_source' };
+    if (artifact && !artifact.isDirectory()) return { authorized: false, reason: 'invalid_artifact' };
+    return { authorized: true, sourceExists: Boolean(source), artifactExists: Boolean(artifact) };
+  } catch {
+    return { authorized: false, reason: 'inaccessible' };
+  }
+}
+
+function frozenPairsFor(sessionId) {
+  const pending = pendingDeletePairs.get(sessionId);
+  if (pending) return pending.map((pair) => ({ ...pair }));
+  const paths = sessionCopyPathsById.get(sessionId) || [];
+  return [...new Set(paths)].sort().map((sourcePath) => ({ sourcePath, artifactPath: artifactPathFor(sourcePath) }));
+}
+
+async function authorizePairsForDelete(pairs, fallbackCwd) {
+  const checks = await Promise.all(pairs.map(pairAuthority));
+  const managedEntries = await Promise.all(pairs.map(async (pair, index) => {
+    if (!checks[index].authorized || !checks[index].sourceExists
+      || sessionRootFor(pair.sourcePath) !== path.resolve(defaultSessionDirectory)) return null;
+    const detail = await parseSessionDetail(pair.sourcePath).catch(() => null);
+    return { sourcePath: pair.sourcePath, cwd: detail?.cwd || fallbackCwd || '' };
+  }));
+  const managedAuthorized = await managedPathsReadOnly(managedEntries.filter(Boolean));
+  return checks.map((check, index) => {
+    const defaultManaged = managedEntries[index];
+    if (defaultManaged && !managedAuthorized.has(defaultManaged.sourcePath)) {
+      return { ...check, authorized: false, reason: 'manager_authority_refused' };
+    }
+    // Artifact-only retry is permitted only when the initial all-pair preflight
+    // durably recorded authority before its source vanished.
+    if (!check.sourceExists && check.artifactExists && pairs[index].managedAuthorized === true) return check;
+    if (!check.sourceExists && check.artifactExists
+      && sessionRootFor(pairs[index].sourcePath) === path.resolve(defaultSessionDirectory)) {
+      return { ...check, authorized: false, reason: 'managed_source_missing' };
+    }
+    return check;
+  });
+}
+
+async function captureManagedArtifactSnapshots(pairs, checks) {
+  const entries = pairs.flatMap((pair, index) => {
+    const defaultRoot = sessionRootFor(pair.sourcePath) === path.resolve(defaultSessionDirectory);
+    return defaultRoot && checks[index].authorized && checks[index].sourceExists && checks[index].artifactExists
+      ? [{ index, root: path.dirname(pair.sourcePath), relative: path.basename(pair.artifactPath) }]
+      : [];
+  });
+  if (!entries.length) return new Map();
+  const packageDirectory = await resolveGjcPackageDirectory();
+  const script = `
+    const { openRecoveryFsRoot } = await import(process.env.GJC_NATIVE_URL);
+    const entries = JSON.parse(process.env.GJC_SNAPSHOT_ENTRIES);
+    const snapshots = [];
+    for (const entry of entries) {
+      const authority = openRecoveryFsRoot(entry.root);
+      try {
+        const captured = authority.snapshotManagedTree(entry.relative);
+        if (captured.ok && captured.snapshot) snapshots.push({ index: entry.index, snapshot: captured.snapshot });
+      } finally {
+        const closed = authority.close();
+        if (!closed.ok) throw new Error(closed.code ?? "managed_artifact_authority_close_failed");
+      }
+    }
+    process.stdout.write(JSON.stringify(snapshots));
+  `;
+  try {
+    const { stdout } = await runFile('bun', ['-e', script], {
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      env: {
+        ...process.env,
+        GJC_NATIVE_URL: gjcNativeModuleUrl(packageDirectory),
+        GJC_SNAPSHOT_ENTRIES: JSON.stringify(entries),
+      },
+    });
+    return new Map(JSON.parse(stdout).map(({ index, snapshot }) => [index, snapshot]));
+  } catch {
+    return new Map();
+  }
+}
+
+function deletionError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function requireMutableSession(sessionId) {
+  if (pendingDeletePairs.has(sessionId)) throw deletionError('deletion_in_progress', '삭제가 진행 중인 세션은 변경할 수 없습니다.');
+  if (!findSessionById(sessionId)) throw deletionError('not_found', '세션을 찾을 수 없습니다.');
+}
+
+async function deleteLogicalSession(session) {
+  const pairs = frozenPairsFor(session.id);
+  const checks = await authorizePairsForDelete(pairs, session.cwd);
+  const snapshots = await captureManagedArtifactSnapshots(pairs, checks);
+  for (const [index, pair] of pairs.entries()) {
+    if (sessionRootFor(pair.sourcePath) === path.resolve(defaultSessionDirectory)
+      && checks[index].sourceExists && checks[index].artifactExists && !snapshots.has(index)) {
+      checks[index] = { ...checks[index], authorized: false, reason: 'managed_artifact_snapshot_unavailable' };
+    }
+    if (snapshots.has(index)) pair.managedArtifactSnapshot = snapshots.get(index);
+  }
+  if (!pairs.length || checks.some((check) => !check.authorized)) {
+    const error = new Error('Delete preflight failed.');
+    error.code = 'delete_preflight_failed';
+    error.result = {
+      deletedCopies: 0,
+      remainingCopies: checks.filter((check) => check.sourceExists).length,
+      remainingArtifacts: checks.filter((check) => check.artifactExists).length,
+      remainingPairs: pairs.map((pair, index) => ({ ...pair, ...checks[index] })),
+      retryable: false,
+    };
+    throw error;
+  }
+  for (const [index, pair] of pairs.entries()) pair.managedAuthorized = checks[index].authorized;
+  pendingDeletePairs.set(session.id, pairs.map((pair) => ({ ...pair })));
+  let failure;
+  for (const pair of pairs) {
+    const before = (await authorizePairsForDelete([pair], session.cwd))[0];
+    if (!before.sourceExists && !before.artifactExists) continue;
+    try {
+      if (!before.sourceExists && before.artifactExists
+        && sessionRootFor(pair.sourcePath) === path.resolve(defaultSessionDirectory)
+        && pair.managedAuthorized === true) {
+        await deleteAuthorizedArtifactOnly(pair);
+      } else {
+        await deleteStoredSession({ filePath: pair.sourcePath });
+      }
+    } catch (error) {
+      failure = error;
+    }
+    const after = (await authorizePairsForDelete([pair], session.cwd))[0];
+    if (!after.authorized || after.sourceExists || after.artifactExists) failure ||= new Error('Frozen deletion pair remains.');
+  }
+  const remaining = await authorizePairsForDelete(pairs, session.cwd);
+  const remainingCopies = remaining.filter((pair) => pair.sourceExists).length;
+  const remainingArtifacts = remaining.filter((pair) => pair.artifactExists).length;
+  const incomplete = remaining.some((pair) => !pair.authorized || pair.sourceExists || pair.artifactExists);
+  if (incomplete) {
+    await refreshIndex([...sessionMap.values()]);
+    const error = new Error(failure?.message || 'Partial delete.');
+    error.code = 'partial_delete';
+    error.result = {
+      deletedCopies: pairs.length - remainingCopies,
+      remainingCopies,
+      remainingArtifacts,
+      remainingPairs: pairs
+        .map((pair, index) => ({ ...pair, ...remaining[index] }))
+        .filter((pair) => !pair.authorized || pair.sourceExists || pair.artifactExists),
+      retryable: true,
+    };
+    throw error;
+  }
+  // A storage operation can report an error after completing deletion. The
+  // final authorized absence predicate, not that stale operation error, defines success.
+  pendingDeletePairs.delete(session.id);
+  sessionMap.delete(session.id);
+  sessionCopyPathsById.delete(session.id);
+  detailCache.delete(session.filePath);
+  status.totalCount = sessionMap.size;
+  status.indexedCount = Math.min(status.indexedCount, status.totalCount);
+  let configPersisted = true;
+  const draft = committedDraft();
+  draft.sessionStatus.delete(session.id);
+  draft.archivedSessionIds.delete(session.id);
+  await writeConfig(draft).then(() => {
+    publishConfig(draft, true);
+  }).catch((error) => {
+    configPersisted = false;
+    publishConfig(draft, true);
+    console.error('Session config save failed:', error.message);
+  });
+  persistCache();
+  return { deleted: session.id, deletedCopies: pairs.length, configPersisted };
+}
+
+function renameSessionSerialized(sessionId, title) {
+  const work = configQueue.then(async () => {
+    requireMutableSession(sessionId);
+    const session = findSessionById(sessionId);
+    await renameStoredSession(session, title);
+    const updated = await parseSessionFile(session.filePath);
+    if (!updated) throw new Error('변경된 세션을 다시 읽지 못했습니다.');
+    sessionMap.set(session.id, updated);
+    detailCache.delete(session.filePath);
+    rotateRevision();
+    persistCache();
+    return updated;
+  });
+  configQueue = work.catch(() => {});
+  return work;
+}
+
+function deleteSessionSerialized(sessionId) {
+  const work = configQueue.then(async () => {
+    let session = findSessionById(sessionId);
+    if (!session && pendingDeletePairs.has(sessionId)) {
+      session = { id: sessionId, filePath: pendingDeletePairs.get(sessionId)[0].sourcePath };
+    }
+    if (!session) throw deletionError('not_found', '세션을 찾을 수 없습니다.');
+    return deleteLogicalSession(session);
+  });
+  configQueue = work.catch(() => {});
+  return work;
 }
 
 async function handleApi(request, response) {
@@ -364,13 +700,16 @@ async function handleApi(request, response) {
       const directoryStat = await stat(directory);
       if (!directoryStat.isDirectory()) throw new Error('폴더가 아닙니다.');
       if (!configuredDirectories().includes(directory)) {
-        customDirectories.push(directory);
-        await saveConfig();
+        await mutateConfig((draft) => {
+          if (draft.directories.includes(directory)) return { changed: false };
+          draft.directories.push(directory);
+          return { changed: true, rotate: false };
+        });
       }
       await initializeIndex(true);
       sendJson(response, 200, { directories: configuredDirectories() });
     } catch (error) {
-      sendJson(response, 400, { error: error.message });
+      sendJson(response, error.code === 'body_too_large' ? 413 : 400, error.code === 'body_too_large' ? { code: error.code } : { error: error.message });
     }
     return true;
   }
@@ -393,19 +732,153 @@ async function handleApi(request, response) {
         sendJson(response, 400, { error: '상태는 active, done, none 중 하나여야 합니다.' });
         return true;
       }
-      const previous = sessionStatus.get(sessionId);
-      if (body.status === 'none') sessionStatus.delete(sessionId);
-      else sessionStatus.set(sessionId, body.status);
       try {
-        await saveConfig();
-      } catch (error) {
-        if (previous) sessionStatus.set(sessionId, previous);
-        else sessionStatus.delete(sessionId);
-        throw error;
-      }
+        await mutateConfig((draft) => {
+          requireMutableSession(sessionId);
+          const previous = draft.sessionStatus.get(sessionId) || 'none';
+          if (previous === body.status) return { changed: false };
+          if (body.status === 'none') draft.sessionStatus.delete(sessionId);
+          else draft.sessionStatus.set(sessionId, body.status);
+          return { changed: true };
+        });
+      } catch (error) { throw error; }
       sendJson(response, 200, { session: publicSessionWithState(session) });
     } catch (error) {
-      sendJson(response, 500, { error: error.message });
+      const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
+      sendJson(response, statusCode, error.code ? { code: error.code, error: error.message } : { error: error.message });
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/archive') {
+    if (request.method !== 'PUT') {
+      sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+      return true;
+    }
+    try {
+      await initializeIndex();
+      const body = await readBody(request);
+      if (!body || !Array.isArray(body.ids) || body.ids.length === 0 || typeof body.archived !== 'boolean') {
+        sendJson(response, 400, { code: 'invalid_ids' });
+        return true;
+      }
+      const ids = [];
+      const seen = new Set();
+      for (const id of body.ids) {
+        if (typeof id !== 'string' || !id.length) {
+          sendJson(response, 400, { code: 'invalid_ids' });
+          return true;
+        }
+        if (!seen.has(id)) {
+          seen.add(id);
+          ids.push(id);
+        }
+      }
+      if (ids.length > 200) {
+        sendJson(response, 400, { code: 'too_many_ids' });
+        return true;
+      }
+      let results;
+      let changed = 0;
+      await mutateConfig((draft) => {
+        results = ids.map((id) => {
+          if (pendingDeletePairs.has(id)) throw deletionError('deletion_in_progress', '삭제가 진행 중인 세션은 변경할 수 없습니다.');
+          if (!findSessionById(id)) return { id, outcome: 'not_found' };
+          const current = draft.archivedSessionIds.has(id);
+          if (current === body.archived) return { id, outcome: 'noop' };
+          if (body.archived) draft.archivedSessionIds.add(id);
+          else draft.archivedSessionIds.delete(id);
+          changed += 1;
+          return { id, outcome: 'changed' };
+        });
+        return { changed: changed > 0 };
+      });
+      sendJson(response, 200, { archived: body.archived, results, changed });
+    } catch (error) {
+      const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'deletion_in_progress' ? 409 : 500;
+      sendJson(response, statusCode, error.code ? { code: error.code, error: error.message } : { error: error.message });
+    }
+    return true;
+  }
+
+  if (url.pathname.startsWith('/api/archive/')) {
+    if (request.method !== 'PUT') {
+      sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+      return true;
+    }
+    try {
+      await initializeIndex();
+      const sessionId = decodeURIComponent(url.pathname.slice('/api/archive/'.length));
+      const session = findSessionById(sessionId);
+      if (!session) {
+        sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
+        return true;
+      }
+      const body = await readBody(request);
+      if (!body || typeof body.archived !== 'boolean') {
+        sendJson(response, 400, { code: 'invalid_archive' });
+        return true;
+      }
+      let changed = false;
+      await mutateConfig((draft) => {
+        requireMutableSession(sessionId);
+        const current = draft.archivedSessionIds.has(sessionId);
+        changed = current !== body.archived;
+        if (!changed) return { changed: false };
+        if (body.archived) draft.archivedSessionIds.add(sessionId);
+        else draft.archivedSessionIds.delete(sessionId);
+        return { changed: true };
+      });
+      sendJson(response, 200, { session: publicSessionWithState(session), changed });
+    } catch (error) {
+      const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
+      sendJson(response, statusCode, error.code ? { code: error.code, error: error.message } : { error: error.message });
+    }
+    return true;
+  }
+
+  const preflightPrefix = '/api/sessions/';
+  if (url.pathname.startsWith(preflightPrefix) && url.pathname.endsWith('/delete-preflight')) {
+    try {
+      const encodedId = url.pathname.slice(preflightPrefix.length, -'/delete-preflight'.length);
+      if (!encodedId || encodedId.includes('/')) return false;
+      if (request.method !== 'GET') {
+        sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+        return true;
+      }
+      let sessionId;
+      try {
+        sessionId = decodeURIComponent(encodedId);
+      } catch {
+        sendJson(response, 400, { code: 'malformed_session_id' });
+        return true;
+      }
+      await initializeIndex();
+      if (!findSessionById(sessionId) && !sessionCopyPathsById.has(sessionId) && !pendingDeletePairs.has(sessionId)) {
+        sendJson(response, 404, { code: 'not_found', error: '세션을 찾을 수 없습니다.' });
+        return true;
+      }
+      const pairs = frozenPairsFor(sessionId);
+      const checks = await authorizePairsForDelete(pairs, findSessionById(sessionId)?.cwd || '');
+      const reported = pairs.map((pair, index) => ({ ...pair, ...checks[index] }));
+      if (!reported.length || reported.some((pair) => !pair.authorized)) {
+        sendJson(response, 409, {
+          code: 'delete_preflight_failed',
+          pairs: reported,
+          sourceCount: pairs.length,
+          artifactCount: pairs.length,
+          authorized: false,
+        });
+        return true;
+      }
+      sendJson(response, 200, {
+        pairs: reported,
+        sourceCount: pairs.length,
+        artifactCount: pairs.length,
+        authorized: true,
+      });
+    } catch (error) {
+      sendJson(response, 500, { code: 'preflight_failed', error: error.message });
     }
     return true;
   }
@@ -414,7 +887,10 @@ async function handleApi(request, response) {
     try {
       await initializeIndex();
       const sessionId = decodeURIComponent(url.pathname.slice('/api/sessions/'.length));
-      const session = findSessionById(sessionId);
+      let session = findSessionById(sessionId);
+      if (!session && pendingDeletePairs.has(sessionId)) {
+        session = { id: sessionId, filePath: pendingDeletePairs.get(sessionId)[0].sourcePath };
+      }
       if (!session) {
         sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
         return true;
@@ -431,12 +907,7 @@ async function handleApi(request, response) {
           sendJson(response, 400, { error: '제목은 제어문자 없이 1~120자로 입력하세요.' });
           return true;
         }
-        await renameStoredSession(session, title);
-        const updated = await parseSessionFile(session.filePath);
-        if (!updated) throw new Error('변경된 세션을 다시 읽지 못했습니다.');
-        sessionMap.set(session.filePath, updated);
-        detailCache.delete(session.filePath);
-        persistCache();
+        const updated = await renameSessionSerialized(session.id, title);
         sendJson(response, 200, { session: publicSessionWithState(updated) });
         return true;
       }
@@ -447,20 +918,11 @@ async function handleApi(request, response) {
           return true;
         }
         const body = await readBody(request);
-        if (body.confirm !== session.id) {
+        if (!body || body.confirm !== session.id) {
           sendJson(response, 400, { error: '삭제하려면 정확한 세션 ID 확인값이 필요합니다.' });
           return true;
         }
-        await deleteStoredSession(session);
-        sessionMap.delete(session.filePath);
-        detailCache.delete(session.filePath);
-        if (sessionStatus.delete(session.id)) {
-          await saveConfig().catch((error) => console.error('Session config save failed:', error.message));
-        }
-        status.totalCount = sessionMap.size;
-        status.indexedCount = Math.min(status.indexedCount, status.totalCount);
-        persistCache();
-        sendJson(response, 200, { deleted: session.id });
+        sendJson(response, 200, await deleteSessionSerialized(session.id));
         return true;
       }
 
@@ -478,8 +940,80 @@ async function handleApi(request, response) {
       }
       sendJson(response, 200, { ...publicSessionWithState(session), ...detail });
     } catch (error) {
-      sendJson(response, 500, { error: error.message });
+      const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
+      sendJson(response, statusCode,
+        error.code ? { code: error.code, ...(error.result || {}), error: error.message } : { error: error.message });
     }
+    return true;
+  }
+
+  if (url.pathname === '/api/models/sessions') {
+    if (request.method !== 'GET') {
+      sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+      return true;
+    }
+    await initializeIndex();
+    if (status.indexing) {
+      sendJson(response, 409, { code: 'indexing' });
+      return true;
+    }
+    if (!url.searchParams.has('model')) {
+      sendJson(response, 400, { code: 'missing_model' });
+      return true;
+    }
+    const strictInteger = (name, fallback, minimum, maximum) => {
+      if (!url.searchParams.has(name)) return fallback;
+      const value = url.searchParams.get(name);
+      if (!/^(0|[1-9]\d*)$/.test(value)) return null;
+      const parsed = Number(value);
+      return parsed >= minimum && parsed <= maximum ? parsed : null;
+    };
+    const offset = strictInteger('offset', 0, 0, Number.MAX_SAFE_INTEGER);
+    const limit = strictInteger('limit', 50, 1, 100);
+    if (offset === null || limit === null) {
+      sendJson(response, 400, { code: 'invalid_pagination' });
+      return true;
+    }
+    const revision = url.searchParams.get('revision');
+    if (offset > 0 && !revision) {
+      sendJson(response, 400, { code: 'missing_revision' });
+      return true;
+    }
+    if (revision && revision !== modelRevision) {
+      sendJson(response, 409, { code: 'stale_revision', currentRevision: modelRevision });
+      return true;
+    }
+    const model = url.searchParams.get('model');
+    const sessions = filterSessions(sessionsSorted(), {
+      from: url.searchParams.get('from') || '',
+      to: url.searchParams.get('to') || '',
+    });
+    const contributions = sessions
+      .map((session) => ({ session, usage: session.models.find((usage) => usage.id === model) }))
+      .filter(({ usage }) => usage)
+      .sort((left, right) => right.usage.tokens - left.usage.tokens
+        || right.session.lastActivity.localeCompare(left.session.lastActivity)
+        || left.session.id.localeCompare(right.session.id))
+      .map(({ session, usage }) => ({
+        id: session.id,
+        title: session.title,
+        preview: session.preview.replace(/\s+/g, ' ').trim().slice(0, 160),
+        cwd: session.cwd,
+        folderName: session.folderName,
+        lastActivity: session.lastActivity,
+        status: sessionStatus.get(session.id) || 'none',
+        archived: archivedSessionIds.has(session.id),
+        usage: { responses: usage.responses, tokens: usage.tokens, cost: usage.cost },
+      }));
+    const page = contributions.slice(offset, offset + limit);
+    sendJson(response, 200, {
+      model,
+      revision: modelRevision,
+      offset,
+      nextOffset: offset + page.length,
+      hasMore: offset + page.length < contributions.length,
+      contributions: page,
+    });
     return true;
   }
 
@@ -495,20 +1029,41 @@ async function handleApi(request, response) {
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
     const from = url.searchParams.get('from') || '';
     const to = url.searchParams.get('to') || '';
+    const archive = ['current', 'archived', 'all'].includes(url.searchParams.get('archive')) ? url.searchParams.get('archive') : 'current';
+    const sort = url.searchParams.has('sort') ? url.searchParams.get('sort') : 'recent';
+    if (!['recent', 'tokens', 'cost'].includes(sort)) {
+      sendJson(response, 400, { code: 'invalid_sort' });
+      return true;
+    }
 
     const scoped = filterSessions(allSessions, { from, to });
     const searched = filterSessions(scoped, { query, folder });
-    // 상태 칩 숫자는 자기 자신을 땜 나머지 조건 기준이다. 눌렀을 때 나오는 개수와 같아야 한다.
-    const counts = { none: 0, active: 0, done: 0 };
-    for (const session of searched) counts[sessionStatus.get(session.id) || 'none'] += 1;
-    const filtered = statuses.length
+    const statusSearched = statuses.length
       ? searched.filter((session) => statuses.includes(sessionStatus.get(session.id) || 'none'))
       : searched;
+    const archiveCounts = { current: 0, archived: 0, all: statusSearched.length };
+    for (const session of statusSearched) archiveCounts[archivedSessionIds.has(session.id) ? 'archived' : 'current'] += 1;
+    const archiveVisible = archive === 'all'
+      ? searched
+      : searched.filter((session) => archivedSessionIds.has(session.id) === (archive === 'archived'));
+    // 상태 칩 숫자는 자기 자신을 땜 나머지 조건 기준이다. 눌렀을 때 나오는 개수와 같아야 한다.
+    const counts = { none: 0, active: 0, done: 0 };
+    for (const session of archiveVisible) counts[sessionStatus.get(session.id) || 'none'] += 1;
+    const filtered = archiveVisible.filter((session) => statuses.length === 0
+      || statuses.includes(sessionStatus.get(session.id) || 'none'));
+    filtered.sort((left, right) => {
+      if (sort === 'tokens' && right.totalTokens !== left.totalTokens) return right.totalTokens - left.totalTokens;
+      if (sort === 'cost' && right.cost !== left.cost) return right.cost - left.cost;
+      if (sort !== 'recent' && right.lastActivity !== left.lastActivity) return right.lastActivity.localeCompare(left.lastActivity);
+      return sort === 'recent'
+        ? right.lastActivity.localeCompare(left.lastActivity) || left.id.localeCompare(right.id)
+        : left.id.localeCompare(right.id);
+    });
 
     const summaryOnly = url.searchParams.get('summaryOnly') === '1';
     const page = summaryOnly ? [] : filtered.slice(offset, offset + limit);
     sendJson(response, 200, {
-      summary: { ...getSummary(scoped), statusCounts: counts },
+      summary: { ...getSummary(scoped), statusCounts: counts, archiveCounts },
       resultCount: filtered.length,
       offset,
       nextOffset: offset + page.length,
