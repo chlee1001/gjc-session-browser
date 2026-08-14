@@ -9,6 +9,9 @@ dist/
 .hallmark/
 skills-lock.json
 
+# 검증하며 만든 진단 산출물 — 저장소 코드가 아니다
+artifacts/
+
 # 비밀값
 .env
 .env.*
