@@ -50,6 +50,7 @@ test('모델을 갈아탄 세션의 사용량을 응답에 적힌 모델별로 �
   });
   const mixed = [
     entries[0],
+    answer('2026-08-10T01:00:30.000Z', '', '', 25, 0.25),
     entries[1],
     answer('2026-08-10T01:02:00.000Z', 'anthropic', 'claude-test', 100, 1),
     { type: 'model_change', timestamp: '2026-08-10T01:03:00.000Z', model: 'openai-codex/gpt-test-2' },
@@ -60,10 +61,11 @@ test('모델을 갈아탄 세션의 사용량을 응답에 적힌 모델별로 �
 
   try {
     const session = await parseSessionFile(file);
-    assert.equal(session.totalTokens, 450);
+    assert.equal(session.totalTokens, 475);
     assert.deepEqual(session.models, [
       { id: 'openai-codex/gpt-test-2', responses: 1, tokens: 300, cost: 2 },
       { id: 'anthropic/claude-test', responses: 2, tokens: 150, cost: 1.5 },
+      { id: '', responses: 1, tokens: 25, cost: 0.25 },
     ], '같은 모델은 합치고 토큰이 많은 쪽이 앞에 온다');
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -202,10 +204,14 @@ test('같은 세션이 두 저장소에 남아 있으면 최근 사본만 목록
   ].map(JSON.stringify).join('\n'));
 
   try {
-    const { sessions, pendingFiles } = await discoverSessions([directory]);
+    const { sessions, pendingFiles, copyPathsById } = await discoverSessions([directory]);
     assert.equal(sessions.length, 1, '같은 id는 한 줄만 남는다');
     assert.equal(sessions[0].filePath, path.join(current, 'session.jsonl'), '최근 활동이 늦은 사본을 고른다');
     assert.deepEqual(pendingFiles, [path.join(current, 'session.jsonl')], '버린 사본은 인덱싱하지 않는다');
+    assert.deepEqual(copyPathsById.get(entries[0].id), [
+      path.join(legacy, 'session.jsonl'),
+      path.join(current, 'session.jsonl'),
+    ].sort(), '목록 승자와 별개로 삭제용 모든 사본 경로를 보존한다');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
