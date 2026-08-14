@@ -212,8 +212,6 @@ export async function parseSessionFile(filePath) {
   let lastActivity = '';
   let messageCount = 0;
   let firstPrompt = '';
-  let totalTokens = 0;
-  let cost = 0;
   let searchText = '';
   const modelUsage = new Map();
   const addUsage = (message, fallbackModel) => {
@@ -239,9 +237,7 @@ export async function parseSessionFile(filePath) {
     if (role === 'user' && !firstPrompt && text) firstPrompt = text;
     if (text && searchText.length < MAX_SEARCH_TEXT) searchText += `\n${text}`;
     if (usage) {
-      const { tokens, spend } = addUsage(entry.message, header.model);
-      totalTokens += tokens;
-      cost += spend;
+      addUsage(entry.message, header.model);
     }
   }
 
@@ -269,8 +265,11 @@ export async function parseSessionFile(filePath) {
 
   const subagentTokens = subagentUsage.reduce((sum, item) => sum + item.tokens, 0);
   const subagentCost = subagentUsage.reduce((sum, item) => sum + item.spend, 0);
-  totalTokens += subagentTokens;
-  cost += subagentCost;
+  // Model buckets are the accounting source of truth. Session and period totals
+  // deliberately reduce these same buckets rather than a second accumulator.
+  const models = [...modelUsage.values()].sort((a, b) => b.tokens - a.tokens || a.id.localeCompare(b.id));
+  const totalTokens = models.reduce((sum, item) => sum + item.tokens, 0);
+  const cost = models.reduce((sum, item) => sum + item.cost, 0);
   return sessionResult(header.session, filePath, fileStat, {
     model: header.model,
     lastActivity,
@@ -280,7 +279,7 @@ export async function parseSessionFile(filePath) {
     cost,
     subagentTokens,
     subagentCost,
-    models: [...modelUsage.values()].sort((a, b) => b.tokens - a.tokens),
+    models,
     artifacts,
     searchText: searchText.slice(0, MAX_SEARCH_TEXT),
     indexed: true,
@@ -358,9 +357,20 @@ export async function discoverSessions(directories, cachedSessions = []) {
     }
   }, DISCOVERY_CONCURRENCY)).filter(Boolean);
 
+  const copyPathsById = new Map();
+  for (const session of found) {
+    const paths = copyPathsById.get(session.id) || [];
+    paths.push(session.filePath);
+    copyPathsById.set(session.id, paths);
+  }
+  for (const paths of copyPathsById.values()) paths.sort();
   const sessions = keepOneCopyPerSession(found);
   sessions.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
-  return { sessions, pendingFiles: sessions.filter((session) => !session.indexed).map((session) => session.filePath) };
+  return {
+    sessions,
+    pendingFiles: sessions.filter((session) => !session.indexed).map((session) => session.filePath),
+    copyPathsById,
+  };
 }
 
 export async function indexSessionFiles(files, onSession) {
