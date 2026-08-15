@@ -30,12 +30,6 @@ function formatRelative(iso) {
   }
 }
 
-function formatBytes(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-}
-
 function splitModel(model) {
   if (!model) return { vendor: '', name: '' };
   const separator = model.lastIndexOf('/');
@@ -74,6 +68,12 @@ const STATUSES = [
 ];
 // 필터에는 "표시 없음"까지 고를 수 있어야 "완료만 빼고 보기"가 된다.
 const STATUS_FACETS = [{ value: 'none', label: '표시 없음' }, ...STATUSES];
+// 보관 범위도 상태와 같은 칩 문법으로 고른다. 라디오 그룹을 따로 두면 같은 "걸러보기"가 두 언어로 갈린다.
+const ARCHIVE_VIEWS = [
+  { value: 'current', label: '현재' },
+  { value: 'archived', label: '보관됨' },
+  { value: 'all', label: '모두' },
+];
 
 /** 받침 유무에 따라 조사를 고른다. "완료으로"같은 틀린 표기를 막는다. */
 function withParticle(word, afterConsonant, afterVowel) {
@@ -132,102 +132,24 @@ function lockBodyScroll() {
 }
 
 /** 기간 통계의 토큰을 응답에 적힌 모델로 쪼개 보여 준다. 한 세션이 여러 모델에 걸치므로 모델별 세션 수를 더하면 전체 세션 수보다 클 수 있다. */
-function ModelUsage({ models, totalTokens, scopeLabel, period, customFrom, customTo, revision, panelResetKey, onArchive }) {
-  const [open, setOpen] = useState(true);
-  const [panels, setPanels] = useState({});
-  const requestsRef = useRef({});
-  const disclosureRefs = useRef({});
-  const { from, to } = periodRange(period, customFrom, customTo);
-
-  const load = async (model, reset = false) => {
-    const panel = panels[model] || { rows: [] };
-    const offset = reset ? 0 : panel.rows.length;
-    const requestRevision = reset ? revision : panel.revision;
-    if (offset > 0 && !requestRevision) return;
-    requestsRef.current[model]?.abort();
-    const controller = new AbortController();
-    requestsRef.current[model] = controller;
-    setPanels((current) => {
-      const currentPanel = current[model] || { rows: [] };
-      return { ...current, [model]: { ...currentPanel, rows: reset ? [] : currentPanel.rows, loading: true, error: '', stale: reset ? false : currentPanel.stale } };
-    });
-    const params = new URLSearchParams({ model, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
-    if (requestRevision) params.set('revision', requestRevision);
-    try {
-      const response = await fetch(`/api/models/sessions?${params}`, { signal: controller.signal });
-      const result = await response.json();
-      if (requestsRef.current[model] !== controller) return;
-      if (response.status === 409 && result.code === 'stale_revision') {
-        setPanels((current) => {
-          const currentPanel = current[model] || panel;
-          return { ...current, [model]: { ...currentPanel, stale: true, loading: false, error: '' } };
-        });
-        return;
-      }
-      if (!response.ok) throw new Error(result.error || '모델 기여 세션을 불러오지 못했습니다.');
-      setPanels((current) => {
-        const currentPanel = current[model] || panel;
-        const rows = reset ? result.contributions : [...currentPanel.rows, ...result.contributions.filter((row) => !currentPanel.rows.some((old) => old.id === row.id))];
-        return {
-          ...current,
-          [model]: {
-            ...currentPanel,
-            rows,
-            revision: result.revision,
-            hasMore: result.hasMore,
-            loading: false,
-            stale: false,
-            error: '',
-          },
-        };
-      });
-    } catch (loadError) {
-      if (loadError.name === 'AbortError' || requestsRef.current[model] !== controller) return;
-      setPanels((current) => {
-        const currentPanel = current[model] || panel;
-        return { ...current, [model]: { ...currentPanel, loading: false, error: loadError.message } };
-      });
-    }
-  };
-
-  useEffect(() => {
-    Object.values(requestsRef.current).forEach((controller) => controller.abort());
-    requestsRef.current = {};
-    setPanels({});
-  }, [panelResetKey]);
-
-  useEffect(() => {
-    Object.values(requestsRef.current).forEach((controller) => controller.abort());
-    requestsRef.current = {};
-    setPanels((current) => Object.fromEntries(Object.entries(current).map(([model, panel]) => [
-      model,
-      panel.open ? { ...panel, stale: true } : panel,
-    ])));
-  }, [revision]);
-
-  const visibleModels = [...models];
-  const currentModelIds = new Set(models.map((item) => item.id));
-  for (const panel of Object.values(panels)) {
-    if (panel.open && panel.item && !currentModelIds.has(panel.item.id)) {
-      visibleModels.push({ ...panel.item, removed: true });
-    }
-  }
+function ModelUsage({ models, totalTokens, scopeLabel, onOpenSessions }) {
+  // 인덱스가 첫 화면을 차지해야 하므로 분석 뷰는 접힌 채로 시작한다.
+  const [open, setOpen] = useState(false);
 
   return (
     <section className="model-usage" aria-label="모델별 사용량">
       <header>
-        <div><h2>모델별 사용량</h2><p>{scopeLabel} · 응답에 기록된 모델 기준 · 서브에이전트 포함</p></div>
+        <div><h2>모델별 사용량</h2>{open ? <p>{scopeLabel} · 응답에 기록된 모델 기준 · 서브에이전트 포함</p> : null}</div>
         <button type="button" aria-expanded={open} aria-controls="model-usage-body" onClick={() => setOpen((value) => !value)}>
-          {open ? '접기' : `모델 ${number.format(visibleModels.length)}개 펼치기`}
+          {open ? '접기' : `모델 ${number.format(models.length)}개 보기`}
         </button>
       </header>
       <div id="model-usage-body" hidden={!open}>
-        {visibleModels.length === 0 ? <p className="model-empty">이 기간에는 집계된 토큰 사용량이 없습니다.</p> : (
+        {models.length === 0 ? <p className="model-empty">이 기간에는 집계된 토큰 사용량이 없습니다.</p> : (
           <ol className="model-list">
-            {visibleModels.map((item) => {
+            {models.map((item) => {
               const { vendor, name } = splitModel(item.id);
               const share = totalTokens ? item.tokens / totalTokens : 0;
-              const panel = panels[item.id] || { rows: [] };
               return (
                 <li key={item.id}>
                   <div className="model-label" title={item.id || undefined}>
@@ -241,42 +163,10 @@ function ModelUsage({ models, totalTokens, scopeLabel, period, customFrom, custo
                     <div><dt>응답</dt><dd>{number.format(item.responses)}</dd></div>
                     <div><dt>세션</dt><dd>{number.format(item.sessions)}</dd></div>
                   </dl>
-                  <div className="model-contributions">
-                    <button
-                      type="button"
-                      ref={(node) => { disclosureRefs.current[item.id] = node; }}
-                      aria-expanded={Boolean(panel.open)}
-                      onClick={() => {
-                        const nextOpen = !panel.open;
-                        setPanels((current) => ({
-                          ...current,
-                          [item.id]: nextOpen
-                            ? { ...(current[item.id] || panel), item: { ...item, removed: undefined }, open: true }
-                            : { open: false, rows: [], item: current[item.id]?.item || item },
-                        }));
-                        if (!nextOpen) requestsRef.current[item.id]?.abort();
-                        if (nextOpen && !panel.rows.length) void load(item.id);
-                      }}
-                    >{panel.open ? '기여 세션 접기' : '기여 세션 보기'}</button>
-                    {panel.open ? (
-                      <div>
-                        {panel.stale ? <div className="stale-panel" role="status">데이터가 갱신됨 · <button type="button" onClick={() => { void load(item.id, true); requestAnimationFrame(() => disclosureRefs.current[item.id]?.focus()); }}>새로 보기</button></div> : null}
-                        {panel.error ? <p className="mutation-message is-error" role="alert">{panel.error}</p> : null}
-                        {panel.rows.map((row) => (
-                          <div className="contribution-row" key={row.id}>
-                            <div><strong>{row.title}</strong><span>{row.preview || '미리보기 없음'}</span><small>{row.folderName} · {formatRelative(row.lastActivity)}</small></div>
-                            <span>{item.tokens ? percent.format(row.usage.tokens / item.tokens) : '—'} · {number.format(row.usage.tokens)} 토큰 · {money.format(row.usage.cost)}</span>
-                            <button type="button" onClick={() => { onArchive(row, !row.archived, 'model').finally(() => requestAnimationFrame(() => disclosureRefs.current[item.id]?.focus())); }} disabled={panel.stale}>{row.archived ? '복원' : '보관'}</button>
-                          </div>
-                        ))}
-                        {panel.loading ? <p role="status">기여 세션을 불러오는 중</p> : null}
-                        {!panel.loading && panel.hasMore && !panel.stale ? <button type="button" onClick={() => void load(item.id)}>더 보기</button> : null}
-                        {!panel.loading && !panel.rows.length && !panel.error
-                          ? <p role="status">이 모델은 현재 기간에 없습니다.</p>
-                          : null}
-                      </div>
-                    ) : null}
-                  </div>
+                  {/* 인라인으로 펼치면 행마다 전폭 한 줄을 쓰고 목록 리듬이 끊긴다. 트리거만 행 안에 두고 내용은 모달로 보낸다. */}
+                  <button className="model-open" type="button" aria-haspopup="dialog" onClick={() => onOpenSessions(item)}>
+                    세션 보기
+                  </button>
                 </li>
               );
             })}
@@ -287,54 +177,179 @@ function ModelUsage({ models, totalTokens, scopeLabel, period, customFrom, custo
   );
 }
 
-const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onArchive, selected, onSelect }) {
+/** 이 모델을 쓴 세션 목록. 세션 상세와 같은 모달 보이스를 쓰고, 행을 누르면 그 세션 상세로 넘어간다. */
+function ModelSessions({ model, from, to, revision, onClose, onSelect }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [hasMore, setHasMore] = useState(false);
+  const [stale, setStale] = useState(false);
+  const loadedRevisionRef = useRef('');
+  const requestRef = useRef(null);
+  const panelRef = useRef(null);
+  const closeRef = useRef(null);
+  const { vendor, name } = splitModel(model.id);
+
+  // offset을 인자로 받는다. rows를 닫으면 "더 보기"가 묵은 길이를 보낸다.
+  const load = useCallback(async (offset, requestRevision) => {
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setLoading(true);
+    setLoadError('');
+    const params = new URLSearchParams({ model: model.id, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    if (requestRevision) params.set('revision', requestRevision);
+    try {
+      const response = await fetch(`/api/models/sessions?${params}`, { signal: controller.signal });
+      const result = await response.json();
+      if (requestRef.current !== controller) return;
+      if (response.status === 409 && result.code === 'stale_revision') {
+        setStale(true);
+        setLoading(false);
+        return;
+      }
+      if (!response.ok) throw new Error(result.error || '이 모델을 쓴 세션을 불러오지 못했습니다.');
+      loadedRevisionRef.current = result.revision;
+      setStale(false);
+      setHasMore(result.hasMore);
+      setRows((current) => (offset === 0
+        ? result.contributions
+        : [...current, ...result.contributions.filter((row) => !current.some((old) => old.id === row.id))]));
+      setLoading(false);
+    } catch (error) {
+      if (error.name === 'AbortError' || requestRef.current !== controller) return;
+      setLoadError(error.message);
+      setLoading(false);
+    }
+  }, [model.id, from, to]);
+
+  useEffect(() => {
+    setRows([]);
+    setHasMore(false);
+    setStale(false);
+    loadedRevisionRef.current = '';
+    void load(0, '');
+    return () => requestRef.current?.abort();
+  }, [load]);
+
+  // 열려 있는 동안 서버 집계가 바뀌면 페이지네이션 커서가 깨진다. 조용히 다시 읽지 않고 알린다.
+  useEffect(() => {
+    if (loadedRevisionRef.current && revision && revision !== loadedRevisionRef.current) setStale(true);
+  }, [revision]);
+
+  useEffect(() => {
+    const restoreScroll = lockBodyScroll();
+    closeRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      restoreScroll();
+    };
+  }, [onClose]);
+
+  return (
+    <div className="detail-layer">
+      <button className="detail-backdrop" type="button" onClick={onClose} aria-label="닫기" />
+      <section className="detail-panel" ref={panelRef} onKeyDown={(event) => trapTabFocus(event, panelRef.current)} role="dialog" aria-modal="true" aria-labelledby="model-sessions-title">
+        <header className="detail-heading">
+          <div>
+            <h2 id="model-sessions-title">{name || '정보 없음'}</h2>
+            <p>{vendor || '모델'} · 토큰 {number.format(model.tokens)} · 비용 {money.format(model.cost)} · 세션 {number.format(model.sessions)}</p>
+          </div>
+          <button ref={closeRef} className="detail-close" type="button" onClick={onClose} aria-label="닫기">×</button>
+        </header>
+        <div className="model-session-list">
+          {stale ? (
+            <div className="stale-panel" role="status">
+              <p>집계가 갱신됐습니다</p>
+              <button type="button" onClick={() => void load(0, revision)}>새로 보기</button>
+            </div>
+          ) : null}
+          {loadError ? <p className="mutation-message is-error" role="alert">{loadError}</p> : null}
+          {rows.map((row) => {
+            const status = STATUSES.find((item) => item.value === row.status);
+            return (
+              <button className="model-session-row" type="button" key={row.id} aria-haspopup="dialog" onClick={() => onSelect(row)}>
+                <div>
+                  <span className="model-session-title">
+                    <strong>{row.title}</strong>
+                    {status ? <em className={`session-flag is-${row.status}`}>{status.label}</em> : null}
+                    {row.archived ? <em className="archive-badge">보관됨</em> : null}
+                  </span>
+                  <span className="model-session-preview">{row.preview || '미리보기 없음'}</span>
+                  <small>{row.folderName} · {formatRelative(row.lastActivity)}</small>
+                </div>
+                <dl className="model-session-figures">
+                  <div><dt>비중</dt><dd>{model.tokens ? percent.format(row.usage.tokens / model.tokens) : '—'}</dd></div>
+                  <div><dt>토큰</dt><dd>{number.format(row.usage.tokens)}</dd></div>
+                  <div><dt>비용</dt><dd>{money.format(row.usage.cost)}</dd></div>
+                </dl>
+              </button>
+            );
+          })}
+          {loading ? <p className="detail-state" role="status">세션을 불러오는 중</p> : null}
+          {!loading && hasMore && !stale ? <button className="model-session-more" type="button" onClick={() => void load(rows.length, loadedRevisionRef.current)}>더 보기</button> : null}
+          {!loading && !stale && !loadError && rows.length === 0
+            ? <p className="detail-state" role="status">이 기간에 이 모델을 쓴 세션이 없습니다.</p>
+            : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onArchive, selectMode, selected, onSelect }) {
   // 세션 헤더의 모델은 마지막으로 고른 하나라 실제로 쓴 모델을 대표하지 못한다. 토큰을 가장 많이 쓴 쪽을 앞에 세운다.
   const model = splitModel(session.models[0]?.id || session.model);
   return (
-    <article className={`session-row is-${session.status}`} id={`session-${session.id}`}>
-      <button className="session-open" type="button" onClick={() => onOpen(session)} aria-label={`${session.title} 상세 정보 열기`}>
-        <div className="session-main">
-          <div className="session-code" aria-hidden="true">{session.folderName.slice(0, 2).toUpperCase()}</div>
-          <div className="session-copy">
-            <div className="session-title-line">
-              <h2>{session.title}</h2>
-              <span className="session-id">{session.id.slice(0, 8)}</span>
-              {session.archived ? <span className="archive-badge">보관됨</span> : null}
-            </div>
-            {session.preview ? <p>{session.preview}</p> : null}
-            <span className="session-path" title={session.cwd}>{session.cwd || '작업 폴더 정보 없음'}</span>
+    <article className={`session-row is-${session.status}${selectMode ? ' is-selecting' : ''}`} id={`session-${session.id}`}>
+      {selectMode ? (
+        <label className="session-select"><input type="checkbox" checked={selected} onChange={() => onSelect(session.id)} aria-label={`${session.title} 선택`} /></label>
+      ) : null}
+      <div className="session-body">
+        <div className="session-copy">
+          <div className="session-title-line">
+            {/* 행 전체를 버튼으로 감싸면 제목이 헤딩으로 읽힐 수 없다. 제목만 버튼으로 두고 CSS로 클릭 영역만 늘린다. */}
+            <h2><button className="session-title" type="button" aria-haspopup="dialog" onClick={() => onOpen(session)}>{session.title}</button></h2>
+            <span className="session-id">{session.id.slice(0, 8)}</span>
+            {session.archived ? <span className="archive-badge">보관됨</span> : null}
           </div>
+          {session.preview ? <p>{session.preview}</p> : null}
+          <span className="session-path">{session.cwd || '작업 폴더 정보 없음'}</span>
         </div>
+        {/* 정렬 기준과 같은 세 개만 남긴다. 메시지 수와 파일 크기는 상세에서 본다. */}
         <dl className="session-metrics">
-          <div><dt>최근 활동</dt><dd title={new Date(session.lastActivity).toLocaleString('ko-KR')}>{formatRelative(session.lastActivity)}</dd></div>
-          <div><dt>메시지</dt><dd>{number.format(session.messageCount)}</dd></div>
+          <div><dt>최근 활동</dt><dd>{formatRelative(session.lastActivity)}</dd></div>
           <div><dt>토큰</dt><dd>{session.totalTokens ? number.format(session.totalTokens) : '—'}</dd></div>
           <div><dt>비용</dt><dd>{session.cost ? money.format(session.cost) : '—'}</dd></div>
-          <div><dt>파일</dt><dd>{formatBytes(session.size)}</dd></div>
         </dl>
-        <div className="session-model" title={session.models.map((item) => `${item.id} ${number.format(item.tokens)}`).join('\n') || session.model || undefined}>
+        <div className="session-model">
           <span>{model.vendor || '모델'}</span>
           <strong>{model.name || '정보 없음'}{session.models.length > 1 ? <em>외 {session.models.length - 1}</em> : null}</strong>
         </div>
-      </button>
-      <label className="session-select"><input type="checkbox" checked={selected} onChange={() => onSelect(session.id)} aria-label={`${session.title} 선택`} /></label>
-      <div className="session-status">
-        {STATUSES.map((item) => {
-          const on = session.status === item.value;
-          return (
-            <button
-              key={item.value}
-              className={`session-mark is-${item.value}`}
-              type="button"
-              aria-pressed={on}
-              aria-label={on ? `${session.title} ${item.label} 표시 해제` : `${session.title} ${withParticle(item.label, '으로', '로')} 표시`}
-              onClick={() => onSetStatus(session.id, on ? 'none' : item.value)}
-            >
-              {item.label}
-            </button>
-          );
-        })}
-        <button className="session-mark is-archive" type="button" title="목록에서만 숨김 · 통계 유지" aria-describedby={`archive-help-${session.id}`} onClick={() => onArchive(session, !session.archived, 'list')}>
+      </div>
+      <div className="session-actions">
+        <div className="session-status" role="group" aria-label={`${session.title} 상태`}>
+          {STATUSES.map((item) => {
+            const on = session.status === item.value;
+            return (
+              <button
+                key={item.value}
+                className={`session-mark is-${item.value}`}
+                type="button"
+                aria-pressed={on}
+                aria-label={on ? `${session.title} ${item.label} 표시 해제` : `${session.title} ${withParticle(item.label, '으로', '로')} 표시`}
+                onClick={() => onSetStatus(session.id, on ? 'none' : item.value)}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+        <button className="row-archive" type="button" aria-describedby={`archive-help-${session.id}`} onClick={() => onArchive(session, !session.archived, 'list')}>
           {session.archived ? '복원' : '보관'}
         </button>
         <span id={`archive-help-${session.id}`} className="sr-only">목록에서만 숨김 · 통계 유지</span>
@@ -514,7 +529,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
       <button className="detail-backdrop" type="button" onClick={onClose} aria-label="상세 정보 닫기" />
       <section className="detail-panel" ref={panelRef} onKeyDown={(event) => trapTabFocus(event, panelRef.current)} role="dialog" aria-modal="true" aria-labelledby="detail-title">
         <header className="detail-heading">
-          <div><span>SESSION DETAIL</span><h2 id="detail-title">{session.title}</h2></div>
+          <div><h2 id="detail-title">{session.title}</h2></div>
           <button ref={closeRef} className="detail-close" type="button" onClick={onClose} aria-label="상세 정보 닫기">×</button>
         </header>
 
@@ -522,23 +537,25 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
         {error ? <div className="detail-state is-error">{error}</div> : null}
         {!loading && !error && detail ? (
           <div className="detail-content">
-            <div className="detail-status" role="group" aria-label="세션 상태">
-              {STATUSES.map((item) => {
-                const on = session.status === item.value;
-                return (
-                  <button
-                    key={item.value}
-                    className={`session-mark is-${item.value}`}
-                    type="button"
-                    aria-pressed={on}
-                    onClick={() => changeStatus(on ? 'none' : item.value)}
-                    disabled={statusSaving || deleting}
-                  >
-                    {item.label}
-                  </button>
-                );
-              })}
-              <button className="session-mark is-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')}>{session.archived ? '복원' : '보관'}</button>
+            <div className="detail-status">
+              <div className="session-status" role="group" aria-label="세션 상태">
+                {STATUSES.map((item) => {
+                  const on = session.status === item.value;
+                  return (
+                    <button
+                      key={item.value}
+                      className={`session-mark is-${item.value}`}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() => changeStatus(on ? 'none' : item.value)}
+                      disabled={statusSaving || deleting}
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <button className="row-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')}>{session.archived ? '복원' : '보관'}</button>
             </div>
             <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
             <form className="rename-form" onSubmit={rename}>
@@ -644,7 +661,8 @@ function App() {
   const [hasMore, setHasMore] = useState(false);
   const [modelRevision, setModelRevision] = useState('');
   const [selectedIds, setSelectedIds] = useState(new Set());
-  const [bulkConfirming, setBulkConfirming] = useState(false);
+  // 선택은 모드다. 평소에 행마다 체크박스를 깔아두면 목록이 아니라 컨트롤 격자가 된다.
+  const [selectMode, setSelectMode] = useState(false);
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
   const [announcement, setAnnouncement] = useState('');
   const [undo, setUndo] = useState(null);
@@ -663,6 +681,7 @@ function App() {
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  const [activeModel, setActiveModel] = useState(null);
   const forceRefresh = useRef(false);
   const loadingMoreRef = useRef(false);
   const searchTriggerRef = useRef(null);
@@ -670,6 +689,7 @@ function App() {
   const listRef = useRef(null);
   const detailRequestRef = useRef(null);
   const detailTriggerRef = useRef(null);
+  const modelTriggerRef = useRef(null);
   const listGenerationRef = useRef(0);
   const indexingCompletionRef = useRef(false);
   const sessionsRef = useRef([]);
@@ -688,7 +708,11 @@ function App() {
 
   useEffect(() => {
     const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${sort}:${period}:${customFrom}:${customTo}`;
-    if (filterResetRef.current && filterResetRef.current !== key) setPanelResetKey((value) => value + 1);
+    if (filterResetRef.current && filterResetRef.current !== key) {
+      setPanelResetKey((value) => value + 1);
+      // 걸러보는 범위가 바뀌면 되돌릴 대상이 화면 밖으로 나간다. 그때만 되돌리기를 닫는다.
+      setUndo(null);
+    }
     filterResetRef.current = key;
   }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters]);
 
@@ -724,7 +748,6 @@ function App() {
     setLoading(true);
     setSessions([]);
     setSelectedIds(new Set());
-    setUndo(null);
     setError('');
     fetchPage(0, { force, signal: controller.signal, generation })
       .catch((fetchError) => {
@@ -809,8 +832,9 @@ function App() {
     requestAnimationFrame(() => searchTriggerRef.current?.focus());
   }, []);
 
-  const openDetail = useCallback(async (session) => {
-    detailTriggerRef.current = document.activeElement;
+  // returnFocusTo를 받는 이유: 모델 모달에서 열 때는 누른 행이 곧 사라지므로 모델 트리거로 돌려야 한다.
+  const openDetail = useCallback(async (session, returnFocusTo) => {
+    detailTriggerRef.current = returnFocusTo || document.activeElement;
     setPaletteOpen(false);
     setSelected(session);
     setDetail(null);
@@ -874,6 +898,31 @@ function App() {
     document.addEventListener('keydown', onShortcut);
     return () => document.removeEventListener('keydown', onShortcut);
   }, []);
+
+  const openModelSessions = useCallback((item) => {
+    modelTriggerRef.current = document.activeElement;
+    setActiveModel(item);
+  }, []);
+
+  const closeModelSessions = useCallback(() => {
+    setActiveModel(null);
+    const trigger = modelTriggerRef.current;
+    modelTriggerRef.current = null;
+    if (trigger?.isConnected) requestAnimationFrame(() => trigger.focus());
+  }, []);
+
+  // 모델 모달의 세션을 누르면 그 자리에서 세션 상세로 갈아끼운다. 모달 두 장을 겹치지 않는다.
+  const openSessionFromModel = useCallback((row) => {
+    const trigger = modelTriggerRef.current;
+    modelTriggerRef.current = null;
+    setActiveModel(null);
+    void openDetail(row, trigger?.isConnected ? trigger : undefined);
+  }, [openDetail]);
+
+  // 기간·필터가 바뀌거나 목록을 다시 읽으면 모달이 보던 집계가 사라진다. 그때는 닫는다.
+  useEffect(() => {
+    setActiveModel(null);
+  }, [panelResetKey]);
 
   const closeDetail = useCallback(() => {
     detailRequestRef.current?.abort();
@@ -1005,7 +1054,7 @@ function App() {
     }
     if (archiveView === 'current' && archived) {
       dropSession(session.id, origin === 'detail');
-      setUndo({ session, expiresAt: Date.now() + 30000 });
+      setUndo({ sessions: [session], expiresAt: Date.now() + 30000 });
       requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
       resultCountRef.current -= 1;
       void reconcile(resultCountRef.current);
@@ -1019,13 +1068,18 @@ function App() {
     }
   }, [applySessionUpdate, archiveView, dropSession, reconcile]);
 
+  // 단건·다건을 같은 일괄 엔드포인트로 되돌린다. 보관은 되돌릴 수 있으므로 확인 단계를 두지 않는다.
   const undoArchive = useCallback(async () => {
     if (!undo || undoSubmittingRef.current) return;
     undoSubmittingRef.current = true;
     setUndoSubmitting(true);
     try {
-      await archiveSession(undo.session, false, 'undo');
+      const ids = undo.sessions.map((session) => session.id);
+      const response = await fetch('/api/archive', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, archived: false }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '보관을 되돌리지 못했습니다.');
       setUndo(null);
+      setAnnouncement(`${number.format(ids.length)}개 세션을 목록으로 되돌렸습니다`);
       setPanelResetKey((key) => key + 1);
       setRequestKey((key) => key + 1);
       requestAnimationFrame(() => resultsHeadingRef.current?.focus());
@@ -1035,7 +1089,7 @@ function App() {
       undoSubmittingRef.current = false;
       setUndoSubmitting(false);
     }
-  }, [archiveSession, undo]);
+  }, [undo]);
 
   useEffect(() => {
     if (!undo || undoSubmitting) return undefined;
@@ -1060,18 +1114,22 @@ function App() {
   const archiveSelected = async () => {
     const ids = [...selectedIds];
     if (!ids.length) return;
+    const picked = sessionsRef.current.filter((session) => selectedIds.has(session.id));
     setBulkSubmitting(true);
     try {
       const response = await fetch('/api/archive', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, archived: true }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || '선택한 세션을 보관하지 못했습니다.');
       const outcomes = result.results.reduce((counts, item) => ({ ...counts, [item.outcome]: (counts[item.outcome] || 0) + 1 }), {});
+      const changedIds = new Set(result.results.filter((item) => item.outcome === 'changed').map((item) => item.id));
+      const changedRows = picked.filter((session) => changedIds.has(session.id));
       setAnnouncement(`보관 완료: 변경 ${outcomes.changed || 0}개, 유지 ${outcomes.noop || 0}개, 찾지 못함 ${outcomes.not_found || 0}개`);
-      setBulkConfirming(false);
       setSelectedIds(new Set());
+      setSelectMode(false);
       setPanelResetKey((key) => key + 1);
       setRequestKey((key) => key + 1);
-      requestAnimationFrame(() => resultsHeadingRef.current?.focus());
+      if (changedRows.length) setUndo({ sessions: changedRows, expiresAt: Date.now() + 30000 });
+      requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
     } catch (batchError) {
       setError(batchError.message);
     } finally {
@@ -1100,20 +1158,33 @@ function App() {
 
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
-  const dialogOpen = paletteOpen || Boolean(selected);
+  const dialogOpen = paletteOpen || Boolean(selected) || Boolean(activeModel);
+  const modelRange = periodRange(period, customFrom, customTo);
   const periodLabel = period === 'custom'
     ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
     : PERIODS.find((item) => item.value === period).label;
   const scopeLabel = statusFilters.length
     ? `${periodLabel} · ${statusFilters.map((value) => STATUS_FACETS.find((item) => item.value === value).label).join(', ')}`
     : periodLabel;
+  // "지금 뭐가 걸려 있나"를 설명하던 문장들을 버리고 초기화 버튼 하나로 줄인다.
+  const filtersActive = Boolean(query) || statusFilters.length > 0 || archiveView !== 'current'
+    || Boolean(folder) || period !== DEFAULT_PERIOD;
+  const resetFilters = () => {
+    setQuery('');
+    setStatusFilters([]);
+    setArchiveView('current');
+    setFolder('');
+    setPeriod(DEFAULT_PERIOD);
+    setCustomFrom('');
+    setCustomTo('');
+  };
 
   return (
     <div className="app-shell">
       {/* 모달이 열리면 배경을 inert로 잠근다. aria-modal만으로는 스크린리더가 배경에 닿는 경우가 있다. */}
       <div inert={dialogOpen || undefined}>
       <nav className="topbar" aria-label="주요 탐색">
-        <a className="wordmark" href="#top" aria-label="GJC Sessions 처음으로"><span>GJC</span> / SESSIONS</a>
+        <a className="wordmark" href="#top" aria-label="GJC Sessions 처음으로"><strong>GJC</strong><em> / SESSIONS</em></a>
         <button className="search-trigger" type="button" ref={searchTriggerRef} onClick={() => setPaletteOpen(true)} aria-expanded={paletteOpen} aria-controls="command-palette">
           <span aria-hidden="true">⌕</span><span>{query || '세션 검색'}</span><kbd>⌘ K</kbd>
         </button>
@@ -1125,32 +1196,35 @@ function App() {
 
       <main id="top">
         <header className="index-header">
-          <div><p>로컬 작업 기록</p><h1>세션 인덱스</h1></div>
+          <h1>세션 인덱스</h1>
           <p className="index-intro">작업 폴더마다 흩어진 GJC 세션을 제목, 대화 내용, 모델과 경로로 찾습니다.</p>
         </header>
 
-        <section className="readout" aria-label="세션 통계">
-          <div><span>세션</span><strong>{summary ? number.format(summary.sessionCount) : '—'}</strong></div>
-          <div><span>작업 폴더</span><strong>{summary ? number.format(summary.folderCount) : '—'}</strong></div>
-          <div><span>메시지</span><strong>{summary ? number.format(summary.totalMessages) : '—'}</strong></div>
-          <div><span>토큰</span><strong>{summary?.totalTokens ? number.format(summary.totalTokens) : '—'}</strong></div>
-          <div><span>비용</span><strong>{summary?.totalCost ? money.format(summary.totalCost) : '—'}</strong></div>
+        {/* 큰 수치 둘 + 보조 셋. 행 지표(3칸)·모델 지표(5칸)와 칸 수를 달리 가져가 같은 격자로 읽히지 않게 한다. */}
+        <section className="readout" aria-label="기간 합계 · 보관 포함">
+          <div className="readout-lead"><span>세션</span><strong>{summary ? number.format(summary.sessionCount) : '—'}</strong></div>
+          <div className="readout-lead"><span>비용</span><strong>{summary?.totalCost ? money.format(summary.totalCost) : '—'}</strong></div>
+          <dl className="readout-rest">
+            <div><dt>작업 폴더</dt><dd>{summary ? number.format(summary.folderCount) : '—'}</dd></div>
+            <div><dt>메시지</dt><dd>{summary ? number.format(summary.totalMessages) : '—'}</dd></div>
+            <div><dt>토큰</dt><dd>{summary?.totalTokens ? number.format(summary.totalTokens) : '—'}</dd></div>
+          </dl>
         </section>
-        <p className="archive-readout">기간 합계 · 보관 포함 · {summary?.archivedSessionCount ? <button type="button" onClick={() => { setArchiveView('archived'); requestAnimationFrame(() => resultsHeadingRef.current?.focus()); }}>보관된 세션 {number.format(summary.archivedSessionCount)}개 보기</button> : '보관된 세션 없음'}</p>
 
         {summary?.indexing ? <div className="index-progress" role="status"><span style={{ width: `${progress}%` }} /><p>목록 사용 가능 · 대화 검색 인덱스 {number.format(summary.indexedCount)}/{number.format(summary.totalCount)}</p></div> : null}
 
-        <ModelUsage models={summary?.models || []} totalTokens={summary?.totalTokens || 0} scopeLabel={periodLabel} period={period} customFrom={customFrom} customTo={customTo} revision={modelRevision} panelResetKey={panelResetKey} onArchive={archiveSession} />
+        <ModelUsage models={summary?.models || []} totalTokens={summary?.totalTokens || 0} scopeLabel={periodLabel} onOpenSessions={openModelSessions} />
 
         <div className="workspace">
           <aside className="filters">
-            <section>
+            <section className="filter-block">
               <h2>범위</h2>
-              <div className="status-filters" role="group" aria-label="상태로 걸러보기">
+              {/* 상태와 보관을 하나의 칩 문법으로 통일한다. 토글 버튼·라디오·설명문이 섞여 있던 자리다. */}
+              <div className="chip-row" role="group" aria-label="상태로 걸러보기">
                 {STATUS_FACETS.map((item) => (
                   <button
                     key={item.value}
-                    className={`status-filter is-${item.value}`}
+                    className="filter-chip"
                     type="button"
                     aria-pressed={statusFilters.includes(item.value)}
                     onClick={() => setStatusFilters((current) => (
@@ -1161,12 +1235,19 @@ function App() {
                   </button>
                 ))}
               </div>
-              <fieldset className="archive-filters"><legend>보관 상태</legend>
-                <label><input type="radio" name="archive-view" checked={archiveView === 'current'} onChange={() => setArchiveView('current')} />현재 세션 <strong>{number.format(archiveCounts.current || 0)}</strong></label>
-                <label><input type="radio" name="archive-view" checked={archiveView === 'archived'} onChange={() => setArchiveView('archived')} />보관됨 <strong>{number.format(archiveCounts.archived || 0)}</strong></label>
-                <label><input type="radio" name="archive-view" checked={archiveView === 'all'} onChange={() => setArchiveView('all')} />모두 보기</label>
-              </fieldset>
-              <p className="scope-note">{statusFilters.length ? '고른 상태만 보입니다.' : '상태를 고르지 않으면 전부 보입니다.'}</p>
+              <div className="chip-row" role="group" aria-label="보관 범위">
+                {ARCHIVE_VIEWS.map((item) => (
+                  <button
+                    key={item.value}
+                    className="filter-chip"
+                    type="button"
+                    aria-pressed={archiveView === item.value}
+                    onClick={() => setArchiveView(item.value)}
+                  >
+                    <span>{item.label}</span>{item.value === 'all' ? null : <strong>{number.format(archiveCounts[item.value] || 0)}</strong>}
+                  </button>
+                ))}
+              </div>
               <label>
                 <span>기간</span>
                 <span className="select-shell">
@@ -1197,24 +1278,38 @@ function App() {
                   </select>
                 </span>
               </label>
-              {query ? <button className="clear-filter" type="button" onClick={() => setQuery('')}>검색어 “{query}” 지우기</button> : null}
+              {filtersActive ? <button className="filter-reset" type="button" onClick={resetFilters}>필터 초기화</button> : null}
             </section>
-            <section>
-              <h2>저장소</h2>
-              <ul className="repository-list">{sessionDirectories.map((item) => <li key={item} title={item}>{item}</li>)}</ul>
-              <form className="directory-form" onSubmit={addDirectory}>
-                <label><span>세션 경로 추가</span><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="~/work/gjc-sessions" aria-invalid={Boolean(directoryError)} aria-describedby="directory-message" /></label>
-                <button type="submit" disabled={addingDirectory || !directory.trim()}>{addingDirectory ? '경로 확인 중' : '경로 추가'}</button>
-                <p id="directory-message" className={directoryError ? 'is-error' : undefined} role={directoryError ? 'alert' : undefined}>{directoryError || 'JSONL 세션이 저장된 폴더를 입력하세요.'}</p>
-              </form>
-            </section>
+            {/* 저장소는 설정성 묶음이다. 접어두면 사이드바가 목록을 밀어내리지 않는다. */}
+            <details className="filter-block">
+              <summary>저장소</summary>
+              <div className="filter-block-body">
+                <ul className="repository-list">{sessionDirectories.map((item) => <li key={item} title={item}>{item}</li>)}</ul>
+                <form className="directory-form" onSubmit={addDirectory}>
+                  <label><span>세션 경로 추가</span><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="~/work/gjc-sessions" aria-invalid={Boolean(directoryError)} aria-describedby="directory-message" /></label>
+                  <button type="submit" disabled={addingDirectory || !directory.trim()}>{addingDirectory ? '경로 확인 중' : '경로 추가'}</button>
+                  <p id="directory-message" className={directoryError ? 'is-error' : undefined} role={directoryError ? 'alert' : undefined}>{directoryError || 'JSONL 세션이 저장된 폴더를 입력하세요.'}</p>
+                </form>
+              </div>
+            </details>
           </aside>
 
           <section className="session-index" aria-busy={loading}>
-            <header className="results-heading" ref={resultsHeadingRef} tabIndex="-1"><div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div><label>정렬 <span className="select-shell"><select value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">최근 활동순</option><option value="tokens">토큰 많은순</option><option value="cost">비용 높은순</option></select></span></label></header>
-            {undo ? <div className="archive-undo" role="status">보관됨 · <button ref={undoRef} type="button" onClick={() => void undoArchive()} disabled={undoSubmitting}>{undoSubmitting ? '복원 중' : '되돌리기'}</button></div> : null}
-            <div className="bulk-bar"><label><input type="checkbox" disabled={bulkSubmitting} checked={sessions.length > 0 && selectedIds.size === sessions.length} onChange={() => setSelectedIds(selectedIds.size === sessions.length ? new Set() : new Set(sessions.map((session) => session.id)))} /> 불러온 행 모두 선택</label>{selectedIds.size ? <button type="button" disabled={bulkSubmitting} onClick={() => setBulkConfirming(true)} aria-expanded={bulkConfirming} aria-controls="bulk-confirmation">선택한 {number.format(selectedIds.size)}개 보관</button> : null}</div>
-            {bulkConfirming ? <section id="bulk-confirmation" className="bulk-confirm" aria-label="일괄 보관 확인"><p role="status">선택한 {number.format(selectedIds.size)}개 세션을 보관합니다</p><button type="button" onClick={() => setBulkConfirming(false)} disabled={bulkSubmitting}>취소</button><button type="button" onClick={() => void archiveSelected()} disabled={bulkSubmitting}>{bulkSubmitting ? '보관 중' : '보관'}</button></section> : null}
+            <header className="results-heading" ref={resultsHeadingRef} tabIndex="-1">
+              <div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div>
+              <div className="results-tools">
+                <button className="select-toggle" type="button" aria-pressed={selectMode} onClick={() => { setSelectMode((value) => !value); setSelectedIds(new Set()); }}>{selectMode ? '선택 끝내기' : '선택'}</button>
+                <label>정렬 <span className="select-shell"><select value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">최근 활동순</option><option value="tokens">토큰 많은순</option><option value="cost">비용 높은순</option></select></span></label>
+              </div>
+            </header>
+            {undo ? <div className="undo-bar" role="status"><p>{number.format(undo.sessions.length)}개 세션을 보관했습니다</p><button ref={undoRef} type="button" onClick={() => void undoArchive()} disabled={undoSubmitting}>{undoSubmitting ? '되돌리는 중' : '되돌리기'}</button></div> : null}
+            {selectMode ? (
+              <div className="bulk-bar">
+                <label><input type="checkbox" disabled={bulkSubmitting} checked={sessions.length > 0 && selectedIds.size === sessions.length} onChange={() => setSelectedIds(selectedIds.size === sessions.length ? new Set() : new Set(sessions.map((session) => session.id)))} /> 불러온 행 모두 선택</label>
+                <p>{selectedIds.size ? `${number.format(selectedIds.size)}개 선택됨` : '선택된 세션 없음'}</p>
+                <button type="button" disabled={bulkSubmitting || !selectedIds.size} onClick={() => void archiveSelected()}>{bulkSubmitting ? '보관 중' : '선택 보관'}</button>
+              </div>
+            ) : null}
             <p className="sr-only" role="status">{announcement}</p>
             {error ? <div className="empty-state is-error" role="alert">{error}</div> : null}
             {!error && loading ? <div className="empty-state">세션 목록을 불러오고 있습니다.</div> : null}
@@ -1224,7 +1319,7 @@ function App() {
                 const session = sessions[virtualRow.index];
                 return (
                   <div key={virtualRow.key} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} className="virtual-row" style={{ transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)` }}>
-                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} onArchive={archiveSession} selected={selectedIds.has(session.id)} onSelect={toggleSelected} />
+                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} onArchive={archiveSession} selectMode={selectMode} selected={selectedIds.has(session.id)} onSelect={toggleSelected} />
                   </div>
                 );
               })}
@@ -1240,6 +1335,7 @@ function App() {
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
       <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onArchive={archiveSession} />
+      {activeModel ? <ModelSessions key={activeModel.id} model={activeModel} from={modelRange.from} to={modelRange.to} revision={modelRevision} onClose={closeModelSessions} onSelect={openSessionFromModel} /> : null}
     </div>
   );
 }

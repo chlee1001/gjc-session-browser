@@ -6,16 +6,16 @@
   --color-ink: oklch(24% 0.02 258);
   --color-body: oklch(34% 0.018 257);
   --color-muted: oklch(54% 0.015 255);
-  --color-faint: oklch(69% 0.012 254);
   --color-rule: oklch(88% 0.01 252);
   --color-rule-strong: oklch(76% 0.018 254);
-  --color-accent: oklch(58% 0.2 256);
+  /* accent·success·danger는 soft 배경 위에서도 글자로 쓰인다. 11px 본문이 AA(4.5:1)를 넘도록 명도를 낮췄다. */
+  --color-accent: oklch(50% 0.2 258);
   --color-accent-ink: oklch(98.5% 0.004 250);
   --color-accent-soft: oklch(93% 0.035 256);
   --color-focus: oklch(50% 0.22 256);
-  --color-success: oklch(54% 0.15 150);
+  --color-success: oklch(48% 0.14 150);
   --color-success-soft: oklch(94% 0.035 150);
-  --color-danger: oklch(56% 0.19 25);
+  --color-danger: oklch(52% 0.19 25);
   --color-danger-soft: oklch(95% 0.035 25);
   --color-overlay: oklch(20% 0.02 258 / 0.38);
   --color-shadow: oklch(24% 0.02 258 / 0.12);
@@ -47,6 +47,16 @@
   --radius-md: 0.625rem;
   --radius-round: 999px;
   --rule-thin: 1px;
+  --rule-thick: 0.125rem;
+
+  /* 모든 인터랙티브 요소의 단일 높이. design.md § Responsive rules의 44px 하한이다. */
+  --control-h: 2.75rem;
+  --size-dot: 0.4375rem;
+
+  --z-raised: 1;
+  --z-sticky: 100;
+  --z-overlay: 700;
+  --z-dialog: 800;
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
