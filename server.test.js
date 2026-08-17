@@ -14,6 +14,40 @@ async function availablePort() {
   return port;
 }
 
+/**
+ * 테스트는 실제 브로커를 타면 안 된다. 개발 머신에서 gjc가 PATH에 있으면 살아있는 세션이
+ * 섞여 들어와 단언이 흔들린다. GJC_SDK_CLI로 이 스텁을 주입해 응답을 고정한다.
+ */
+async function writeSdkStub(home, payload) {
+  const stub = path.join(home, "sdk-stub.mjs");
+  await writeFile(stub, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify(${JSON.stringify(payload)}));
+`);
+  await chmod(stub, 0o755);
+  return stub;
+}
+
+/** 브로커가 없는 상태. 기존 테스트는 SDK 없이 돌던 그대로여야 한다. */
+async function writeSdkOffStub(home) {
+  return writeSdkStub(home, { ok: false, error: { code: "broker_unavailable", message: "no broker" } });
+}
+
+function sdkEntry({ id, repo, live = true, at = Date.now(), pid = 4242 }) {
+  return {
+    sessionId: id,
+    locator: { repo, stateRoot: `${repo}/.gjc/state` },
+    endpointGeneration: 1,
+    pid,
+    live,
+    deleted: false,
+    indexSeq: 1,
+    // live:false 인데 activity 가 남아있는 실측 잔여(12건)를 그대로 재현한다.
+    activity: { state: "active", at },
+    lastHeartbeatAt: at,
+    identityProvenance: "composite",
+  };
+}
+
 async function waitForServer(baseUrl) {
   for (let attempt = 0; attempt < 80; attempt += 1) {
     try {
@@ -48,6 +82,7 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
   await writeFile(sessionFile, `${entries.map(JSON.stringify).join('\n')}\n`);
   await writeFile(copiedSessionFile, `${entries.map(JSON.stringify).join('\n')}\n`);
 
+  const sdkStub = await writeSdkOffStub(home);
   const port = await availablePort();
   const server = spawn(process.execPath, ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
@@ -57,6 +92,7 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
       NODE_ENV: 'production',
       PORT: String(port),
       GJC_CODING_AGENT_DIR: agentDirectory,
+      GJC_SDK_CLI: sdkStub,
       GJC_SESSION_DIR: registeredRoot,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -418,6 +454,7 @@ test('기본 관리 경로는 승인된 아티팩트 전용 재시도로만 부�
       };
     }
   `);
+  const sdkStub = await writeSdkOffStub(home);
   const port = await availablePort();
   const server = spawn(process.execPath, ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
@@ -427,6 +464,7 @@ test('기본 관리 경로는 승인된 아티팩트 전용 재시도로만 부�
       NODE_ENV: 'production',
       PORT: String(port),
       GJC_CODING_AGENT_DIR: agentDirectory,
+      GJC_SDK_CLI: sdkStub,
       GJC_PACKAGE_DIR: fakePackage,
       GJC_FAKE_AUTHORIZED_PATHS: JSON.stringify([sessionFile, replacedSessionFile]),
       GJC_FAKE_NATIVE_THROW_AFTER_REMOVE: 'session',
@@ -525,6 +563,7 @@ test('원자적 설정 공개 전에는 목록과 revision이 함께 이전 상�
     };
     syncBuiltinESMExports();
   `);
+  const sdkStub = await writeSdkOffStub(home);
   const port = await availablePort();
   const server = spawn(process.execPath, ['--import', hookPath, 'server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
@@ -534,6 +573,7 @@ test('원자적 설정 공개 전에는 목록과 revision이 함께 이전 상�
       NODE_ENV: 'production',
       PORT: String(port),
       GJC_CODING_AGENT_DIR: agentDirectory,
+      GJC_SDK_CLI: sdkStub,
       GJC_SESSION_DIR: sessionRoot,
       GJC_TEST_CONFIG_PATH: path.join(home, '.gjc', 'session-list.json'),
       GJC_TEST_READY_PATH: readyPath,
@@ -589,9 +629,10 @@ test('삭제 뒤 설정 저장 실패도 원본 삭제를 되살리지 않고 �
   await writeFile(sessionFile, `${JSON.stringify({
     type: 'session', version: 4, id: sessionId, timestamp: '2026-08-10T01:00:00.000Z', cwd: home, title: '삭제 복구',
   })}\n`);
+  const sdkStub = await writeSdkOffStub(home);
   const start = async (port) => spawn(process.execPath, ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
-    env: { ...process.env, HOME: home, NODE_ENV: 'production', PORT: String(port), GJC_CODING_AGENT_DIR: agentDirectory, GJC_SESSION_DIR: sessionRoot },
+    env: { ...process.env, HOME: home, NODE_ENV: 'production', PORT: String(port), GJC_CODING_AGENT_DIR: agentDirectory, GJC_SESSION_DIR: sessionRoot, GJC_SDK_CLI: sdkStub },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let port = await availablePort();
@@ -634,6 +675,410 @@ test('삭제 뒤 설정 저장 실패도 원본 삭제를 되살리지 않고 �
     const restarted = await waitForServer(`http://127.0.0.1:${port}`);
     assert.equal(restarted.resultCount, 0);
     assert.equal(restarted.summary.archivedSessionCount, 0);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/** SDK 오버레이 테스트용 최소 서버 기동 헬퍼. 세션 파일 하나와 SDK 응답을 주면 목록을 돌려준다. */
+async function startOverlayServer({ home, sessions = [], sdkPayload }) {
+  const agentDirectory = path.join(home, 'agent');
+  const sessionRoot = path.join(home, 'sessions');
+  for (const entry of sessions) {
+    const directory = path.join(sessionRoot, entry.scope);
+    await mkdir(path.join(directory, 'session'), { recursive: true });
+    await writeFile(path.join(directory, 'session.jsonl'), `${JSON.stringify({
+      type: 'session', version: 4, id: entry.id, timestamp: entry.timestamp || '2026-08-10T01:00:00.000Z',
+      cwd: entry.cwd || home, title: entry.title || '파일 세션',
+    })}\n`);
+  }
+  const sdkStub = await writeSdkStub(home, sdkPayload);
+  const port = await availablePort();
+  const server = spawn(process.execPath, ['server.js'], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: {
+      ...process.env,
+      HOME: home,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      GJC_CODING_AGENT_DIR: agentDirectory,
+      GJC_SESSION_DIR: sessionRoot,
+      GJC_SDK_CLI: sdkStub,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let listing = await waitForServer(baseUrl);
+  for (let attempt = 0; listing.summary.indexing && attempt < 80; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
+  }
+  // 첫 요청은 캐시가 비어 있고 갱신은 뒤에서 돈다(응답을 절대 막지 않는 설계).
+  // 그 첫 갱신이 스냅샷에 반영될 때까지 폴링한다.
+  const wantsLive = (sdkPayload?.result?.sessions || []).some((entry) => entry.live === true);
+  for (let attempt = 0; wantsLive && listing.summary.liveCount === 0 && attempt < 80; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
+  }
+  return { server, baseUrl, listing };
+}
+
+test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없는 세션을 가상 행으로 올린다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-overlay-'));
+  const liveId = '9d51d5d8-0000-4000-8000-00000000a001';
+  const deadId = '9d51d5d8-0000-4000-8000-00000000a002';
+  const orphanId = '9d51d5d8-0000-4000-8000-00000000a003';
+  const orphanRepo = path.join(home, 'outside-repo');
+  const at = Date.parse('2026-08-16T09:00:00.000Z');
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [
+      { id: liveId, scope: 'live-scope', title: '살아있는 파일 세션' },
+      { id: deadId, scope: 'dead-scope', title: '죽은 파일 세션' },
+    ],
+    sdkPayload: {
+      ok: true,
+      result: {
+        version: 1,
+        source: 'broker',
+        sessions: [
+          // 1) 라이브 + 파일 있음
+          sdkEntry({ id: liveId, repo: home, live: true, at, pid: 111 }),
+          // 2) 죽음 + 파일 있음 — activity 잔여가 있어도 live:false면 죽은 것이다
+          sdkEntry({ id: deadId, repo: home, live: false, at, pid: 222 }),
+          // 3) 라이브 + 파일 없음 → 가상 행
+          sdkEntry({ id: orphanId, repo: orphanRepo, live: true, at, pid: 333 }),
+        ],
+      },
+    },
+  });
+
+  try {
+    const listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    const byId = new Map(listing.sessions.map((session) => [session.id, session]));
+
+    // 1) 라이브 + 파일 있음: live가 붙고 lastActivity가 activity.at으로 치환된다.
+    assert.equal(byId.get(liveId).live, true);
+    assert.equal(byId.get(liveId).lastActivity, new Date(at).toISOString());
+    assert.equal(byId.get(liveId).sdkOnly, false);
+
+    // 2) 죽음 + 파일 있음: live는 false이고 파일 기준 시각이 유지된다.
+    assert.equal(byId.get(deadId).live, false);
+    assert.notEqual(byId.get(deadId).lastActivity, new Date(at).toISOString());
+
+    // 3) 라이브 + 파일 없음: 가상 행이 생긴다.
+    const orphan = byId.get(orphanId);
+    assert.equal(orphan.sdkOnly, true);
+    assert.equal(orphan.live, true);
+    assert.equal(orphan.filePath, '');
+    assert.equal(orphan.totalTokens, 0);
+    assert.equal(orphan.cwd, orphanRepo);
+
+    // 카운트 분리: 파일 2 + 가상 1
+    assert.equal(listing.resultCount, 3);
+    assert.equal(listing.fileResultCount, 2);
+    assert.equal(listing.sdkOnlyCount, 1);
+    assert.equal(listing.summary.liveCount, 2);
+
+    // live 필터는 살아있는 것만 남긴다.
+    const liveListing = await (await fetch(`${baseUrl}/api/sessions?live=1`)).json();
+    assert.equal(liveListing.resultCount, 2);
+    assert.ok(liveListing.sessions.every((session) => session.live));
+
+    // 폴더 옵션에 가상 세션의 repo가 병합되고, 그 폴더로 거르면 가상 행이 남는다.
+    const folder = listing.summary.folders.find((item) => item.cwd === orphanRepo);
+    assert.ok(folder, '가상 세션의 repo가 폴더 옵션에 있어야 한다');
+    assert.equal(folder.count, 1);
+    const folderListing = await (await fetch(`${baseUrl}/api/sessions?folder=${encodeURIComponent(orphanRepo)}`)).json();
+    assert.equal(folderListing.resultCount, 1);
+    assert.equal(folderListing.sessions[0].id, orphanId);
+    // 폴더 옆 개수가 실제 필터 결과와 일치해야 한다.
+    assert.equal(folder.count, folderListing.resultCount);
+
+    // 토큰·비용 총계는 파일 세션만 센다 — 가상 행이 집계를 오염시키지 않는다.
+    assert.equal(listing.summary.totalTokens, 0);
+    assert.equal(listing.summary.sessionCount, 2);
+
+    // 가상 행: 상태·보관은 동작하고 제목 변경·삭제는 404다.
+    const statusResponse = await fetch(`${baseUrl}/api/status/${orphanId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+    });
+    assert.equal(statusResponse.status, 200);
+    assert.equal((await statusResponse.json()).session.status, 'active');
+
+    const archiveResponse = await fetch(`${baseUrl}/api/archive/${orphanId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true }),
+    });
+    assert.equal(archiveResponse.status, 200);
+
+    const renameResponse = await fetch(`${baseUrl}/api/sessions/${orphanId}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: '바꿀 수 없다' }),
+    });
+    assert.equal(renameResponse.status, 404);
+
+    const deleteResponse = await fetch(`${baseUrl}/api/sessions/${orphanId}`, {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: orphanId }),
+    });
+    assert.equal(deleteResponse.status, 404);
+
+    // 가상 행 상세는 GET으로 열린다.
+    const detail = await fetch(`${baseUrl}/api/sessions/${orphanId}`);
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json()).lastExchange, null);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('브로커가 ok:false면 500이 아니라 조용히 degrade한다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-degrade-'));
+  const sessionId = '9d51d5d8-0000-4000-8000-00000000b001';
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [{ id: sessionId, scope: 'scope', title: '파일 세션' }],
+    sdkPayload: { ok: false, error: { code: 'broker_unavailable', message: 'no broker' } },
+  });
+
+  try {
+    const response = await fetch(`${baseUrl}/api/sessions`);
+    assert.equal(response.status, 200);
+    const listing = await response.json();
+    assert.equal(listing.summary.liveCount, 0);
+    assert.equal(listing.resultCount, 1);
+    assert.equal(listing.fileResultCount, 1);
+    assert.equal(listing.sdkOnlyCount, 0);
+    // live 키는 항상 존재하고 값은 false다.
+    assert.equal(listing.sessions[0].live, false);
+    assert.equal(listing.sessions[0].sdkOnly, false);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('가상 행에 찍은 상태는 그 세션의 파일이 생긴 뒤에도 그대로 이어진다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-transition-'));
+  const sessionId = '9d51d5d8-0000-4000-8000-00000000c001';
+  const at = Date.parse('2026-08-16T09:00:00.000Z');
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [],
+    sdkPayload: {
+      ok: true,
+      result: {
+        version: 1,
+        source: 'broker',
+        sessions: [sdkEntry({ id: sessionId, repo: home, live: true, at })],
+      },
+    },
+  });
+
+  try {
+    const before = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    assert.equal(before.sessions.length, 1);
+    assert.equal(before.sessions[0].sdkOnly, true);
+
+    await fetch(`${baseUrl}/api/status/${sessionId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+    });
+
+    // 세션이 이제 전사본을 쓴다. 같은 id의 파일이 생긴다.
+    const directory = path.join(home, 'sessions', 'late-scope');
+    await mkdir(path.join(directory, 'session'), { recursive: true });
+    await writeFile(path.join(directory, 'session.jsonl'), `${JSON.stringify({
+      type: 'session', version: 4, id: sessionId, timestamp: '2026-08-16T09:00:00.000Z', cwd: home, title: '이제 파일이 생겼다',
+    })}\n`);
+
+    let after = await (await fetch(`${baseUrl}/api/sessions?refresh=1`)).json();
+    for (let attempt = 0; after.summary.indexing && attempt < 80; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      after = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    }
+
+    // 같은 id가 두 줄로 늘어나지 않고 진짜 행 하나로 바뀐다.
+    const rows = after.sessions.filter((session) => session.id === sessionId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].sdkOnly, false);
+    assert.equal(rows[0].title, '이제 파일이 생겼다');
+    // 가상 행일 때 찍어둔 상태가 살아남는다.
+    assert.equal(rows[0].status, 'active');
+    // 여전히 살아있으므로 live는 유지된다.
+    assert.equal(rows[0].live, true);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('상세 조회와 변형 응답도 목록과 같은 live 오버레이를 얹는다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-detail-overlay-'));
+  const sessionId = '9d51d5d8-0000-4000-8000-00000000d001';
+  const at = Date.parse('2026-08-16T09:00:00.000Z');
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [{ id: sessionId, scope: 'scope', title: '살아있는 파일 세션' }],
+    sdkPayload: {
+      ok: true,
+      result: { version: 1, source: 'broker', sessions: [sdkEntry({ id: sessionId, repo: home, live: true, at, pid: 777 })] },
+    },
+  });
+
+  try {
+    // 목록에 LIVE가 뜨는데 열면 없는 모순이 없어야 한다.
+    const detail = await (await fetch(`${baseUrl}/api/sessions/${sessionId}`)).json();
+    assert.equal(detail.live, true);
+    assert.equal(detail.pid, 777);
+
+    // 상태를 바꿔도 그 행의 live가 사라지지 않아야 한다. 사라지면 배지가 깜빡인다.
+    const statusResult = await (await fetch(`${baseUrl}/api/status/${sessionId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+    })).json();
+    assert.equal(statusResult.session.live, true);
+
+    const archiveResult = await (await fetch(`${baseUrl}/api/archive/${sessionId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true }),
+    })).json();
+    assert.equal(archiveResult.session.live, true);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('브로커가 망가진 값을 줘도 목록은 200을 유지한다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-garbage-'));
+  const sessionId = '9d51d5d8-0000-4000-8000-00000000e001';
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [{ id: sessionId, scope: 'scope', title: '파일 세션' }],
+    sdkPayload: {
+      ok: true,
+      result: {
+        version: 1,
+        source: 'broker',
+        sessions: [
+          // 시각이 문자열·NaN·음수, locator 없음, sessionId 없음/숫자, 중복 id — 전부 목록을 죽이면 안 된다.
+          { sessionId: '9d51d5d8-0000-4000-8000-00000000e002', locator: { repo: home }, live: true, activity: { state: 'active', at: 'not-a-date' }, lastHeartbeatAt: 'nope' },
+          { sessionId: '9d51d5d8-0000-4000-8000-00000000e003', live: true, activity: { state: 'active', at: Number.NaN } },
+          { sessionId: '9d51d5d8-0000-4000-8000-00000000e004', locator: { repo: '' }, live: true, activity: { state: 'active', at: -1 } },
+          { sessionId: null, locator: { repo: home }, live: true, activity: { state: 'active', at: Date.now() } },
+          { sessionId: 12345, locator: { repo: home }, live: true, activity: { state: 'active', at: Date.now() } },
+          { sessionId: '9d51d5d8-0000-4000-8000-00000000e005', locator: { repo: home }, live: true, activity: { state: 'active', at: Date.now() } },
+          { sessionId: '9d51d5d8-0000-4000-8000-00000000e005', locator: { repo: home }, live: true, activity: { state: 'active', at: Date.now() } },
+          null,
+          'garbage',
+        ],
+      },
+    },
+  });
+
+  try {
+    const response = await fetch(`${baseUrl}/api/sessions`);
+    assert.equal(response.status, 200);
+    const listing = await response.json();
+    // 파일 세션은 무슨 일이 있어도 남는다.
+    assert.ok(listing.sessions.some((session) => session.id === sessionId));
+    // 어떤 행에도 Invalid Date가 새어나오지 않는다.
+    for (const session of listing.sessions) {
+      assert.notEqual(session.lastActivity, 'Invalid Date');
+      if (session.lastActivity) assert.ok(!Number.isNaN(Date.parse(session.lastActivity)));
+    }
+    // 중복 id는 한 줄로 접힌다.
+    const dupes = listing.sessions.filter((session) => session.id === '9d51d5d8-0000-4000-8000-00000000e005');
+    assert.equal(dupes.length, 1);
+    // sessionId가 성하지 않은 항목은 행이 되지 않는다.
+    assert.ok(!listing.sessions.some((session) => session.id === '12345' || !session.id));
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('브로커가 시각을 ISO 문자열로 줘도 실시간 값으로 인정한다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-iso-'));
+  const fileId = '9d51d5d8-0000-4000-8000-00000000f101';
+  const orphanId = '9d51d5d8-0000-4000-8000-00000000f102';
+  const iso = '2026-08-16T09:30:00.000Z';
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [{ id: fileId, scope: 'scope', title: '파일 세션' }],
+    sdkPayload: {
+      ok: true,
+      result: {
+        version: 1,
+        source: 'broker',
+        sessions: [
+          // epoch ms 대신 ISO 문자열. 숫자로만 강제하면 이 값이 조용히 버려진다.
+          { sessionId: fileId, locator: { repo: home }, live: true, pid: 501, activity: { state: 'active', at: iso }, lastHeartbeatAt: iso },
+          { sessionId: orphanId, locator: { repo: home }, live: true, pid: 502, activity: { state: 'active', at: iso }, lastHeartbeatAt: iso },
+        ],
+      },
+    },
+  });
+
+  try {
+    const listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    const byId = new Map(listing.sessions.map((session) => [session.id, session]));
+    // 파일 세션: 파일 시각으로 되돌아가지 않고 브로커 시각이 얹혀야 한다.
+    assert.equal(byId.get(fileId).lastActivity, iso);
+    // 가상 세션: 현재 시각 폴백이 아니라 준 시각 그대로여야 한다.
+    assert.equal(byId.get(orphanId).lastActivity, iso);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('브로커 스텁이 깨진 JSON이나 비정상 종료를 내도 목록은 살아있다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-broken-'));
+  const agentDirectory = path.join(home, 'agent');
+  const sessionRoot = path.join(home, 'sessions');
+  const sessionId = '9d51d5d8-0000-4000-8000-00000000f001';
+  const directory = path.join(sessionRoot, 'scope');
+  await mkdir(path.join(directory, 'session'), { recursive: true });
+  await writeFile(path.join(directory, 'session.jsonl'), `${JSON.stringify({
+    type: 'session', version: 4, id: sessionId, timestamp: '2026-08-10T01:00:00.000Z', cwd: home, title: '파일 세션',
+  })}\n`);
+  // 깨진 JSON을 뱉고 1로 죽는 스텁.
+  const stub = path.join(home, 'broken-stub.mjs');
+  await writeFile(stub, '#!/usr/bin/env node\nprocess.stdout.write("{not json");\nprocess.exit(1);\n');
+  await chmod(stub, 0o755);
+
+  const port = await availablePort();
+  const server = spawn(process.execPath, ['server.js'], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: {
+      ...process.env, HOME: home, NODE_ENV: 'production', PORT: String(port),
+      GJC_CODING_AGENT_DIR: agentDirectory, GJC_SESSION_DIR: sessionRoot, GJC_SDK_CLI: stub,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${port}`;
+    let listing = await waitForServer(baseUrl);
+    for (let attempt = 0; listing.summary.indexing && attempt < 80; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    }
+    // 여러 번 불러 실패가 누적돼도(2회 연속 비우기 규칙) 목록은 그대로다.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/sessions`);
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.summary.liveCount, 0);
+      assert.ok(body.sessions.some((session) => session.id === sessionId));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));
