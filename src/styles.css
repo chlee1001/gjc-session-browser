@@ -182,6 +182,10 @@ details.filter-block { display: block; padding-bottom: 0; }
 .session-path { display: block; overflow: hidden; color: var(--color-muted); font: var(--text-xs)/1.4 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .session-id { flex: none; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-rule); border-radius: var(--radius-xs); color: var(--color-muted); background: var(--color-paper); font: var(--text-xs)/1 var(--font-mono); }
 .archive-badge { flex: none; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-xs); color: var(--color-muted); background: var(--color-paper-2); font: var(--text-xs)/1 var(--font-mono); font-style: normal; white-space: nowrap; }
+/* 살아있는 세션 표시. success 쌍을 쓴다 — accent는 포커스·주 동작 전용이라 장식에 쓰지 않는다.
+   점멸은 화면 전체에서 인덱싱 점 하나뿐이므로 animation을 넣지 않는다. */
+.live-badge { flex: none; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-success); border-radius: var(--radius-xs); color: var(--color-success); background: var(--color-success-soft); font: 500 var(--text-xs)/1 var(--font-mono); font-style: normal; white-space: nowrap; }
+.live-count { display: inline-flex; align-items: center; color: var(--color-success); font: 500 var(--text-xs)/1 var(--font-mono); white-space: nowrap; }
 /* 정렬 기준(최근 활동·토큰·비용) 세 개만 남긴다. 메시지·파일 크기는 상세에서 본다. */
 .session-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-md); margin: 0; }
 .session-metrics div { min-width: 0; }

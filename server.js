@@ -23,6 +23,13 @@ const runFile = promisify(execFileCallback);
 
 let customDirectories = [];
 const STATUS_VALUES = ['none', 'active', 'done'];
+// SDK 브로커 호출은 프로세스 spawn 한 번이 0.6초다. 요청 안에서 기다리지 않고
+// 만료된 값을 그대로 돌려주면서 뒤에서 갱신한다(stale-while-revalidate).
+const SDK_CALL_TIMEOUT_MS = 4000;
+const SDK_LIVE_TTL_MS = 5000;
+const SDK_IDLE_TTL_MS = 30000;
+let sdkCache = { fetchedAt: 0, sessions: [], failures: 0 };
+let sdkInflight = null;
 let sessionStatus = new Map();
 let sessionMap = new Map();
 let sessionCopyPathsById = new Map();
@@ -224,6 +231,139 @@ function findSessionById(sessionId) {
 
 function persistCache() {
   void saveCache(generation).catch((error) => console.error('Session cache save failed:', error.message));
+}
+
+/**
+ * 브로커가 보고하는 살아있음. `live`만 보면 안 된다 — 죽은 프로세스가 activity를
+ * 남긴 잔여 항목이 실측 12건 있었다. 두 조건을 모두 만족해야 살아있는 세션이다.
+ */
+function isSdkLive(entry) {
+  return entry?.live === true && entry?.activity?.state === 'active';
+}
+
+/**
+ * 브로커가 준 시각을 ISO로 바꾼다. 실측 표본은 epoch ms 숫자지만 ISO 문자열도 받는다 —
+ * 숫자로만 강제하면 문자열 시각을 조용히 버려 최근 활동이 파일 값으로 되돌아간다.
+ * 값이 이상하면 빈 문자열이다. 여기서 던지면 파일 스캔만으로도 떠야 할 목록이 통째로 500이 된다.
+ */
+function sdkInstant(value) {
+  const at = typeof value === 'string' ? Date.parse(value) : Number(value);
+  if (!Number.isFinite(at) || at <= 0) return '';
+  const date = new Date(at);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+/**
+ * `gjc sdk session list` 한 번. 브로커 부재·타임아웃·비정상 종료·JSON 파싱 실패·ok:false는
+ * 전부 빈 배열로 수렴한다. 목록은 SDK 없이도 그대로 떠야 하므로 여기서 절대 던지지 않는다.
+ * 테스트는 GJC_SDK_CLI로 바이너리 경로를 주입해 실제 브로커를 타지 않게 한다.
+ */
+async function sdkSessionList() {
+  try {
+    const { stdout } = await runFile(
+      process.env.GJC_SDK_CLI || 'gjc',
+      ['sdk', 'session', 'list', '--timeout-ms', String(SDK_CALL_TIMEOUT_MS)],
+      { timeout: SDK_CALL_TIMEOUT_MS + 1000, maxBuffer: 8 * 1024 * 1024 },
+    );
+    const payload = JSON.parse(stdout);
+    if (payload?.ok !== true || !Array.isArray(payload.result?.sessions)) return null;
+    return payload.result.sessions.filter((entry) => entry && typeof entry === 'object');
+  } catch {
+    return null;
+  }
+}
+
+function sdkTtl() {
+  return sdkCache.sessions.some(isSdkLive) ? SDK_LIVE_TTL_MS : SDK_IDLE_TTL_MS;
+}
+
+/**
+ * 현재 스냅샷을 즉시 돌려주고, 만료됐으면 갱신을 뒤에서 시작한다. 이 함수는 절대 await하지 않는다.
+ * 동시 요청이 겹쳐도 in-flight 하나를 공유해 CLI를 중복 spawn하지 않는다.
+ */
+function sdkSnapshot() {
+  const stale = Date.now() - sdkCache.fetchedAt >= sdkTtl();
+  if (stale && !sdkInflight) {
+    sdkInflight = sdkSessionList().then((sessions) => {
+      if (sessions) {
+        sdkCache = { fetchedAt: Date.now(), sessions, failures: 0 };
+      } else {
+        const failures = sdkCache.failures + 1;
+        // 한 번 실패는 일시적일 수 있어 직전 값을 유지한다. 연속 두 번이면 브로커가
+        // 정말 없는 것으로 보고 비운다 — 죽은 세션을 계속 LIVE로 보여주는 것이 더 나쁘다.
+        sdkCache = {
+          fetchedAt: Date.now(),
+          sessions: failures >= 2 ? [] : sdkCache.sessions,
+          failures,
+        };
+      }
+    }).finally(() => {
+      sdkInflight = null;
+    });
+  }
+  // sessionId 가 성한 항목만 남긴다. Map 이므로 중복 id 는 마지막 하나로 접힌다.
+  return new Map(sdkCache.sessions
+    .filter((entry) => typeof entry?.sessionId === 'string' && entry.sessionId.length > 0)
+    .map((entry) => [entry.sessionId, entry]));
+}
+
+/** 파일 세션 위에 브로커 상태를 얹는다. 죽은 항목의 하트비트가 파일 시각을 덮지 않게 게이팅한다. */
+function withSdkOverlay(session, entry) {
+  const live = isSdkLive(entry);
+  const activityAt = live ? sdkInstant(entry.activity?.at) : '';
+  return {
+    ...session,
+    live,
+    pid: live ? entry.pid : 0,
+    sdkOnly: false,
+    lastActivity: activityAt || session.lastActivity,
+  };
+}
+
+/**
+ * 파일이 아직 없는 살아있는 세션. 파일 세션과 같은 필드 모양으로 채워야
+ * filterSessions·집계·정렬·페이지 나누기를 고치지 않고 그대로 통과한다.
+ */
+function sdkOnlySession(entry) {
+  const cwd = entry.locator?.repo || '';
+  const folderName = cwd ? path.basename(cwd) : '알 수 없음';
+  // 시각을 못 믿을 땐 현재 시각으로 떨어뜨린다. 살아있다고 보고된 세션이니 지금이 가장 가까운 근사다.
+  const lastActivity = sdkInstant(entry.activity?.at) || sdkInstant(entry.lastHeartbeatAt) || new Date().toISOString();
+  return {
+    id: entry.sessionId,
+    title: `${folderName} · 기록 준비 중`,
+    cwd,
+    folderName,
+    startedAt: '',
+    lastActivity,
+    model: '',
+    messageCount: 0,
+    totalTokens: 0,
+    cost: 0,
+    subagentTokens: 0,
+    subagentCost: 0,
+    models: [],
+    size: 0,
+    mtimeMs: 0,
+    filePath: '',
+    preview: '',
+    indexed: false,
+    live: true,
+    pid: entry.pid || 0,
+    sdkOnly: true,
+    // filterSessions와 같은 소문자 정규화를 써야 검색이 파일 세션과 동일하게 동작한다.
+    searchText: `${entry.sessionId}\n${cwd}\n${folderName}`.toLocaleLowerCase(),
+  };
+}
+
+/** 파일 인덱스에 전혀 없는 살아있는 세션만 가상 행으로 만든다. */
+function sdkOnlyRows(sdk) {
+  const rows = [];
+  for (const entry of sdk.values()) {
+    if (!isSdkLive(entry) || findSessionById(entry.sessionId)) continue;
+    rows.push(sdkOnlySession(entry));
+  }
+  return rows;
 }
 
 function publicSessionWithState(session) {
@@ -719,7 +859,9 @@ async function handleApi(request, response) {
       await initializeIndex();
       const sessionId = decodeURIComponent(url.pathname.slice('/api/status/'.length));
       const session = findSessionById(sessionId);
-      if (!session) {
+      // 파일이 아직 없는 살아있는 세션도 상태를 찍을 수 있다. 상태·보관은 id만으로 성립한다.
+      const sdkEntry = session ? null : sdkSnapshot().get(sessionId);
+      if (!session && !isSdkLive(sdkEntry)) {
         sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
         return true;
       }
@@ -732,17 +874,21 @@ async function handleApi(request, response) {
         sendJson(response, 400, { error: '상태는 active, done, none 중 하나여야 합니다.' });
         return true;
       }
-      try {
-        await mutateConfig((draft) => {
-          requireMutableSession(sessionId);
-          const previous = draft.sessionStatus.get(sessionId) || 'none';
-          if (previous === body.status) return { changed: false };
-          if (body.status === 'none') draft.sessionStatus.delete(sessionId);
-          else draft.sessionStatus.set(sessionId, body.status);
-          return { changed: true };
-        });
-      } catch (error) { throw error; }
-      sendJson(response, 200, { session: publicSessionWithState(session) });
+      await mutateConfig((draft) => {
+        // requireMutableSession은 파일 세션 전용이다. 가상 세션은 삭제 진행 검사만 인라인으로 한다.
+        if (session) requireMutableSession(sessionId);
+        else if (pendingDeletePairs.has(sessionId)) {
+          throw deletionError('deletion_in_progress', '삭제가 진행 중인 세션은 변경할 수 없습니다.');
+        }
+        const previous = draft.sessionStatus.get(sessionId) || 'none';
+        if (previous === body.status) return { changed: false };
+        if (body.status === 'none') draft.sessionStatus.delete(sessionId);
+        else draft.sessionStatus.set(sessionId, body.status);
+        return { changed: true };
+      });
+      sendJson(response, 200, {
+        session: publicSessionWithState(session ? withSdkOverlay(session, sdkSnapshot().get(sessionId)) : sdkOnlySession(sdkEntry)),
+      });
     } catch (error) {
       const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
       sendJson(response, statusCode, error.code ? { code: error.code, error: error.message } : { error: error.message });
@@ -780,10 +926,12 @@ async function handleApi(request, response) {
       }
       let results;
       let changed = 0;
+      // ids는 최대 200개다. 콜백 안에서 스냅샷을 다시 만들면 그만큼 Map을 재구축한다.
+      const sdk = sdkSnapshot();
       await mutateConfig((draft) => {
         results = ids.map((id) => {
           if (pendingDeletePairs.has(id)) throw deletionError('deletion_in_progress', '삭제가 진행 중인 세션은 변경할 수 없습니다.');
-          if (!findSessionById(id)) return { id, outcome: 'not_found' };
+          if (!findSessionById(id) && !isSdkLive(sdk.get(id))) return { id, outcome: 'not_found' };
           const current = draft.archivedSessionIds.has(id);
           if (current === body.archived) return { id, outcome: 'noop' };
           if (body.archived) draft.archivedSessionIds.add(id);
@@ -810,7 +958,8 @@ async function handleApi(request, response) {
       await initializeIndex();
       const sessionId = decodeURIComponent(url.pathname.slice('/api/archive/'.length));
       const session = findSessionById(sessionId);
-      if (!session) {
+      const sdkEntry = session ? null : sdkSnapshot().get(sessionId);
+      if (!session && !isSdkLive(sdkEntry)) {
         sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
         return true;
       }
@@ -821,7 +970,10 @@ async function handleApi(request, response) {
       }
       let changed = false;
       await mutateConfig((draft) => {
-        requireMutableSession(sessionId);
+        if (session) requireMutableSession(sessionId);
+        else if (pendingDeletePairs.has(sessionId)) {
+          throw deletionError('deletion_in_progress', '삭제가 진행 중인 세션은 변경할 수 없습니다.');
+        }
         const current = draft.archivedSessionIds.has(sessionId);
         changed = current !== body.archived;
         if (!changed) return { changed: false };
@@ -829,7 +981,10 @@ async function handleApi(request, response) {
         else draft.archivedSessionIds.delete(sessionId);
         return { changed: true };
       });
-      sendJson(response, 200, { session: publicSessionWithState(session), changed });
+      sendJson(response, 200, {
+        session: publicSessionWithState(session ? withSdkOverlay(session, sdkSnapshot().get(sessionId)) : sdkOnlySession(sdkEntry)),
+        changed,
+      });
     } catch (error) {
       const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
       sendJson(response, statusCode, error.code ? { code: error.code, error: error.message } : { error: error.message });
@@ -891,12 +1046,28 @@ async function handleApi(request, response) {
       if (!session && pendingDeletePairs.has(sessionId)) {
         session = { id: sessionId, filePath: pendingDeletePairs.get(sessionId)[0].sourcePath };
       }
+      // 가상 세션은 GET 상세만 된다. 제목 변경·삭제는 아래 분기별 가드가 404로 막는다.
+      if (!session && request.method === 'GET') {
+        const sdkEntry = sdkSnapshot().get(sessionId);
+        if (isSdkLive(sdkEntry)) {
+          sendJson(response, 200, {
+            ...publicSessionWithState(sdkOnlySession(sdkEntry)),
+            lastExchange: null,
+          });
+          return true;
+        }
+      }
       if (!session) {
         sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
         return true;
       }
 
       if (request.method === 'PATCH') {
+        // 공유 가드와 똑같은 술어를 분기 첫 줄에 복제한다. 좁히면 부분 삭제 재시도가 404로 막힌다.
+        if (!findSessionById(sessionId) && !pendingDeletePairs.has(sessionId)) {
+          sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
+          return true;
+        }
         if (status.indexing) {
           sendJson(response, 409, { error: '인덱싱이 끝난 뒤 다시 시도하세요.' });
           return true;
@@ -908,11 +1079,15 @@ async function handleApi(request, response) {
           return true;
         }
         const updated = await renameSessionSerialized(session.id, title);
-        sendJson(response, 200, { session: publicSessionWithState(updated) });
+        sendJson(response, 200, { session: publicSessionWithState(withSdkOverlay(updated, sdkSnapshot().get(session.id))) });
         return true;
       }
 
       if (request.method === 'DELETE') {
+        if (!findSessionById(sessionId) && !pendingDeletePairs.has(sessionId)) {
+          sendJson(response, 404, { error: '세션을 찾을 수 없습니다.' });
+          return true;
+        }
         if (status.indexing) {
           sendJson(response, 409, { error: '인덱싱이 끝난 뒤 다시 시도하세요.' });
           return true;
@@ -938,7 +1113,9 @@ async function handleApi(request, response) {
         detail = await parseSessionDetail(session.filePath);
         detailCache.set(session.filePath, { mtimeMs: session.mtimeMs, detail });
       }
-      sendJson(response, 200, { ...publicSessionWithState(session), ...detail });
+      // 목록과 같은 오버레이를 얹는다. 없으면 LIVE인 세션을 열었을 때 프로세스·실시간 칸이 사라진다.
+      const overlaid = withSdkOverlay(session, sdkSnapshot().get(session.id));
+      sendJson(response, 200, { ...publicSessionWithState(overlaid), ...detail });
     } catch (error) {
       const statusCode = error.code === 'body_too_large' ? 413 : error.code === 'not_found' ? 404 : error.code === 'deletion_in_progress' ? 409 : 500;
       sendJson(response, statusCode,
@@ -1020,8 +1197,14 @@ async function handleApi(request, response) {
   if (url.pathname !== '/api/sessions') return false;
 
   try {
-    await initializeIndex(url.searchParams.get('refresh') === '1');
-    const allSessions = sessionsSorted();
+    const forceRefresh = url.searchParams.get('refresh') === '1';
+    await initializeIndex(forceRefresh);
+    // "다시 스캔"은 SDK 상태까지 지금 것으로 보자는 뜻이다.
+    if (forceRefresh) sdkCache = { ...sdkCache, fetchedAt: 0 };
+    const sdk = sdkSnapshot();
+    const fileSessions = sessionsSorted().map((session) => withSdkOverlay(session, sdk.get(session.id)));
+    // 합집합은 여기 한 번만 만들고, 이후 필터·집계·정렬·페이지 나누기는 손대지 않는다.
+    const allSessions = [...fileSessions, ...sdkOnlyRows(sdk)];
     const query = url.searchParams.get('q') || '';
     const folder = url.searchParams.get('folder') || '';
     const statuses = (url.searchParams.get('status') || '').split(',').filter((value) => STATUS_VALUES.includes(value));
@@ -1035,6 +1218,7 @@ async function handleApi(request, response) {
       sendJson(response, 400, { code: 'invalid_sort' });
       return true;
     }
+    const liveOnly = url.searchParams.get('live') === '1';
 
     const scoped = filterSessions(allSessions, { from, to });
     const searched = filterSessions(scoped, { query, folder });
@@ -1049,8 +1233,11 @@ async function handleApi(request, response) {
     // 상태 칩 숫자는 자기 자신을 땜 나머지 조건 기준이다. 눌렀을 때 나오는 개수와 같아야 한다.
     const counts = { none: 0, active: 0, done: 0 };
     for (const session of archiveVisible) counts[sessionStatus.get(session.id) || 'none'] += 1;
-    const filtered = archiveVisible.filter((session) => statuses.length === 0
+    const scopedByFilters = archiveVisible.filter((session) => statuses.length === 0
       || statuses.includes(sessionStatus.get(session.id) || 'none'));
+    // 실행 중 칩 숫자는 live 축을 걸기 전 기준이다. 그래야 칩을 눌렀을 때 나오는 개수와 같다.
+    const liveCount = scopedByFilters.filter((session) => session.live).length;
+    const filtered = liveOnly ? scopedByFilters.filter((session) => session.live) : scopedByFilters;
     filtered.sort((left, right) => {
       if (sort === 'tokens' && right.totalTokens !== left.totalTokens) return right.totalTokens - left.totalTokens;
       if (sort === 'cost' && right.cost !== left.cost) return right.cost - left.cost;
@@ -1062,9 +1249,28 @@ async function handleApi(request, response) {
 
     const summaryOnly = url.searchParams.get('summaryOnly') === '1';
     const page = summaryOnly ? [] : filtered.slice(offset, offset + limit);
+    // 토큰·비용·메시지 총계는 파일 진실만 센다. 가상 세션은 그 숫자를 모른다.
+    const summary = getSummary(scoped.filter((session) => !session.sdkOnly));
+    // 폴더 옵션에는 SDK-only 세션의 repo도 들어가야 그 폴더로 걸러볼 수 있다.
+    // 덧붙이기가 아니라 개수 누적이어야 파일과 SDK가 섞인 폴더의 숫자가 맞는다.
+    const folderIndex = new Map(summary.folders.map((item) => [item.cwd, { ...item }]));
+    for (const session of scoped) {
+      if (!session.sdkOnly || !session.cwd) continue;
+      const hit = folderIndex.get(session.cwd);
+      if (hit) hit.count += 1;
+      else folderIndex.set(session.cwd, { cwd: session.cwd, name: path.basename(session.cwd), count: 1 });
+    }
+    summary.folders = [...folderIndex.values()]
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    summary.folderCount = summary.folders.length;
+    // 목록 재조정은 파일 세션 기준으로만 비교한다. 가상 행은 브로커 사정으로 늘고 줄어서
+    // 사용자 조작에 대한 기대 개수와 무관하다.
+    const fileResultCount = filtered.filter((session) => !session.sdkOnly).length;
     sendJson(response, 200, {
-      summary: { ...getSummary(scoped), statusCounts: counts, archiveCounts },
+      summary: { ...summary, statusCounts: counts, archiveCounts, liveCount },
       resultCount: filtered.length,
+      fileResultCount,
+      sdkOnlyCount: filtered.length - fileResultCount,
       offset,
       nextOffset: offset + page.length,
       hasMore: offset + page.length < filtered.length,

@@ -315,6 +315,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onAr
             {/* 행 전체를 버튼으로 감싸면 제목이 헤딩으로 읽힐 수 없다. 제목만 버튼으로 두고 CSS로 클릭 영역만 늘린다. */}
             <h2><button className="session-title" type="button" aria-haspopup="dialog" onClick={() => onOpen(session)}>{session.title}</button></h2>
             <span className="session-id">{session.id.slice(0, 8)}</span>
+            {session.live ? <span className="live-badge">LIVE</span> : null}
             {session.archived ? <span className="archive-badge">보관됨</span> : null}
           </div>
           {session.preview ? <p>{session.preview}</p> : null}
@@ -559,8 +560,10 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             </div>
             <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
             <form className="rename-form" onSubmit={rename}>
-              <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled} /></label>
-              <button type="submit" disabled={saving || deleting || mutationDisabled || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
+              <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
+              <button type="submit" aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={saving || deleting || mutationDisabled || session.sdkOnly || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
+              {/* 비활성 사유를 스크린리더가 읽을 수 있어야 한다. 시각적으로도 남긴다. */}
+              {session.sdkOnly ? <p id="sdk-only-help" className="archive-helper">기록 파일이 아직 없어 제목 변경과 삭제를 쓸 수 없습니다.</p> : null}
             </form>
 
             <dl className="detail-grid">
@@ -568,11 +571,15 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
               <div><dt>작업 폴더</dt><CopyableValue label="작업 폴더" value={session.cwd} /></div>
               <div><dt>세션 파일</dt><CopyableValue label="세션 파일" value={session.filePath} /></div>
               <div><dt>모델</dt><dd><code>{session.model || '—'}</code></dd></div>
-              <div><dt>시작</dt><dd>{new Date(session.startedAt).toLocaleString('ko-KR')}</dd></div>
-              <div><dt>최근 활동</dt><dd>{new Date(session.lastActivity).toLocaleString('ko-KR')}</dd></div>
+              <div><dt>시작</dt><dd>{session.startedAt ? new Date(session.startedAt).toLocaleString('ko-KR') : '—'}</dd></div>
+              <div><dt>최근 활동</dt><dd>{session.lastActivity ? new Date(session.lastActivity).toLocaleString('ko-KR') : '—'}</dd></div>
               <div><dt>메시지</dt><dd>{number.format(session.messageCount)}</dd></div>
               <div><dt>토큰 · 비용</dt><dd>{number.format(session.totalTokens)} · {money.format(session.cost)}</dd></div>
               <div><dt>서브에이전트 몫</dt><dd>{session.subagentTokens ? `${number.format(session.subagentTokens)} · ${money.format(session.subagentCost)}` : '없음'}</dd></div>
+              {session.live ? <div><dt>프로세스</dt><dd>{session.pid ? `PID ${session.pid}` : '—'}</dd></div> : null}
+              {session.live ? <div><dt>실시간</dt><dd>실행 중 · {formatRelative(session.lastActivity)}</dd></div> : null}
+              {/* 목록에 보이면 그리로 갈 길을 같이 둔다. */}
+              {session.live ? <div><dt>이어서 열기</dt><CopyableValue label="세션 이어서 열기 명령" value={`gjc --session ${session.id}`} /></div> : null}
             </dl>
 
             {session.models.length > 0 ? (
@@ -599,7 +606,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             <section className="danger-zone">
               <div><h3>세션 삭제</h3><p>세션 기록과 연결된 아티팩트를 영구 삭제합니다.</p></div>
               {!confirmingDelete ? (
-                <button ref={deleteRevealRef} type="button" onClick={revealDelete} disabled={mutationDisabled}>삭제</button>
+                <button ref={deleteRevealRef} type="button" onClick={revealDelete} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={mutationDisabled || session.sdkOnly}>삭제</button>
               ) : (
                 <div className="delete-confirm">
                   <p>삭제 후 복구할 수 없습니다. 아래 범위를 영구 삭제합니다.</p>
@@ -651,6 +658,7 @@ function App() {
   const [statusCounts, setStatusCounts] = useState({ none: 0, active: 0, done: 0 });
   const [archiveCounts, setArchiveCounts] = useState({ current: 0, archived: 0 });
   const [archiveView, setArchiveView] = useState('current');
+  const [liveOnly, setLiveOnly] = useState(false);
   const [sort, setSort] = useState('recent');
   const [period, setPeriod] = useState(DEFAULT_PERIOD);
   const [customFrom, setCustomFrom] = useState('');
@@ -694,6 +702,9 @@ function App() {
   const indexingCompletionRef = useRef(false);
   const sessionsRef = useRef([]);
   const resultCountRef = useRef(0);
+  // 목록 재조정은 파일 세션 기준으로만 비교한다. 가상 행은 브로커 사정으로 늘고 줄어서
+  // 사용자 조작에 대한 기대 개수와 무관하다.
+  const fileResultCountRef = useRef(0);
   const resultsHeadingRef = useRef(null);
   const undoRef = useRef(null);
   const undoSubmittingRef = useRef(false);
@@ -707,19 +718,20 @@ function App() {
   }, [resultCount]);
 
   useEffect(() => {
-    const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${sort}:${period}:${customFrom}:${customTo}`;
+    const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${sort}:${period}:${customFrom}:${customTo}:${liveOnly}`;
     if (filterResetRef.current && filterResetRef.current !== key) {
       setPanelResetKey((value) => value + 1);
       // 걸러보는 범위가 바뀌면 되돌릴 대상이 화면 밖으로 나간다. 그때만 되돌리기를 닫는다.
       setUndo(null);
     }
     filterResetRef.current = key;
-  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters]);
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters, liveOnly]);
 
   const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
     const { from, to } = periodRange(period, customFrom, customTo);
     const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
     if (force) params.set('refresh', '1');
+    if (liveOnly) params.set('live', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
     if (!response.ok) throw new Error('세션을 불러오지 못했습니다.');
     const result = await response.json();
@@ -730,6 +742,7 @@ function App() {
     setModelRevision(result.summary.modelRevision || '');
     setResultCount(result.resultCount);
     resultCountRef.current = result.resultCount;
+    fileResultCountRef.current = result.fileResultCount ?? result.resultCount;
     const existing = append ? new Set(sessionsRef.current.map((session) => session.id)) : new Set();
     const pageRows = append ? result.sessions.filter((session) => !existing.has(session.id)) : result.sessions;
     setHasMore((append ? sessionsRef.current.length + pageRows.length : pageRows.length) < result.resultCount);
@@ -738,7 +751,7 @@ function App() {
       const currentIds = new Set(current.map((session) => session.id));
       return [...current, ...result.sessions.filter((session) => !currentIds.has(session.id))];
     });
-  }, [deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo]);
+  }, [deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo, liveOnly]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -759,12 +772,44 @@ function App() {
     return () => controller.abort();
   }, [fetchPage, requestKey]);
 
+  // 살아있는 세션이 있을 때만 목록을 스스로 갱신한다. 화면을 켜두고 보고 있는 동안
+  // LIVE 배지와 최근 활동이 멈춘 값으로 남지 않게 하는 것이 목적이다.
+  useEffect(() => {
+    if (summary?.indexing) return undefined;
+    // 살아있는 세션이 없을 때도 느리게(30초) 돈다. 6초 폴링을 live>0 조건으로만 걸면
+    // 브로커가 죽거나 세션이 다 끝난 뒤 liveCount가 0이 되는 순간 타이머가 멈추고,
+    // 그 값을 되살릴 유일한 수단이 그 타이머라서 새 세션이 떠도 영영 안 보인다.
+    // spawn 상한은 클라이언트 간격이 아니라 서버 TTL이 정한다. 유휴 30초로 늦추면
+    // 로컬 HTTP 요청이 1/5로 줄고, CLI spawn은 서버 TTL 때문에 약 60초에 1회로 묶인다.
+    // 탭을 여러 개 열면 요청은 탭 수만큼 늘어난다(계획의 다중 탭 리스크 참조).
+    const interval = summary?.liveCount > 0 ? 6000 : 30000;
+    // 선택 모드에서는 목록을 갈아끼우지 않는다. 첫 페이지 구성원이 바뀌면 화면에 없는 세션이
+    // 선택된 채로 남아 일괄 보관이 엉뚱한 대상을 건드린다. 되돌리기가 떠 있을 때도 같다.
+    if (selectMode || undo) return undefined;
+    let timer = null;
+    const tick = () => {
+      // 두 페이지 이상 불러온 뒤에는 건너뛴다. fetchPage(0)은 목록을 첫 페이지로 통째
+      // 교체하므로 가상 스크롤러 높이가 무너지고 무한스크롤이 연쇄로 터진다.
+      if (sessionsRef.current.length > PAGE_SIZE) return;
+      void fetchPage(0, { generation: listGenerationRef.current }).catch(() => {});
+    };
+    const start = () => { if (!timer) timer = setInterval(tick, interval); };
+    const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+    if (document.visibilityState === 'visible') start();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') { tick(); start(); } else stop();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVisibility); };
+  }, [summary?.liveCount, summary?.indexing, fetchPage, selectMode, undo]);
+
   useEffect(() => {
     if (!summary?.indexing) return undefined;
     indexingCompletionRef.current = false;
     const timer = setTimeout(async () => {
       const { from, to } = periodRange(period, customFrom, customTo);
       const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, summaryOnly: '1' });
+      if (liveOnly) params.set('live', '1');
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
         if (!result.summary.indexing && !indexingCompletionRef.current) {
@@ -947,6 +992,7 @@ function App() {
     const generation = ++listGenerationRef.current;
     const { from, to } = periodRange(period, customFrom, customTo);
     const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: '0', limit: String(PAGE_SIZE), summaryOnly: '1' });
+    if (liveOnly) params.set('live', '1');
     try {
       const response = await fetch(`/api/sessions?${params}`);
       const result = await response.json();
@@ -958,8 +1004,11 @@ function App() {
       setModelRevision(result.summary.modelRevision || '');
       setResultCount(result.resultCount);
       resultCountRef.current = result.resultCount;
+      const fileCount = result.fileResultCount ?? result.resultCount;
+      fileResultCountRef.current = fileCount;
       setHasMore(sessionsRef.current.length < result.resultCount);
-      if (result.resultCount !== expectedCount) {
+      // 기대 개수는 파일 세션 기준이다. 가상 행 증감으로 목록을 리셋하지 않는다.
+      if (fileCount !== expectedCount) {
         setSessions([]);
         setPanelResetKey((key) => key + 1);
         setRequestKey((key) => key + 1);
@@ -970,7 +1019,7 @@ function App() {
       setPanelResetKey((key) => key + 1);
       setRequestKey((key) => key + 1);
     }
-  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters]);
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters, liveOnly]);
 
   const dropSession = useCallback((sessionId, close = true) => {
     const rows = sessionsRef.current.filter((session) => session.id !== sessionId);
@@ -990,7 +1039,7 @@ function App() {
     if (!response.ok) throw new Error(result.error || '세션 제목을 변경하지 못했습니다.');
 
     applySessionUpdate(sessionId, result.session);
-    void reconcile(resultCountRef.current);
+    void reconcile(fileResultCountRef.current);
     return result.session;
   }, [applySessionUpdate, reconcile]);
 
@@ -1028,8 +1077,13 @@ function App() {
 
     // 걸러보는 상태 밖으로 나가면 목록에서 빠진다.
     const visible = sessionsRef.current.some((session) => session.id === sessionId);
-    const expectedCount = statusFilters.length && !statusFilters.includes(result.session.status) ? resultCountRef.current - 1 : resultCountRef.current;
-    if (statusFilters.length && !statusFilters.includes(result.session.status)) dropSession(sessionId, false);
+    // 기대 개수는 파일 세션 축이다. reconcile이 같은 축으로 비교하므로 여기서도 맞춘다.
+    // 가상 행은 파일 축에 없으니 목록에서 빠져도 이 숫자를 줄이지 않는다.
+    const leavesFilter = statusFilters.length > 0 && !statusFilters.includes(result.session.status);
+    const expectedCount = leavesFilter && !result.session.sdkOnly
+      ? fileResultCountRef.current - 1
+      : fileResultCountRef.current;
+    if (leavesFilter) dropSession(sessionId, false);
     else applySessionUpdate(sessionId, result.session);
     if (visible) void reconcile(expectedCount);
     else setRequestKey((key) => key + 1);
@@ -1052,19 +1106,23 @@ function App() {
       setRequestKey((key) => key + 1);
       return;
     }
+    // 가상 행은 파일 축 카운트에 들어있지 않다. 빠져도 그 축을 줄이면 안 된다.
+    const dropsFileRow = !session.sdkOnly;
     if (archiveView === 'current' && archived) {
       dropSession(session.id, origin === 'detail');
       setUndo({ sessions: [session], expiresAt: Date.now() + 30000 });
       requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
       resultCountRef.current -= 1;
-      void reconcile(resultCountRef.current);
+      if (dropsFileRow) fileResultCountRef.current -= 1;
+      void reconcile(fileResultCountRef.current);
     } else if (archiveView === 'archived' && !archived) {
       dropSession(session.id, origin === 'detail');
       resultCountRef.current -= 1;
-      void reconcile(resultCountRef.current);
+      if (dropsFileRow) fileResultCountRef.current -= 1;
+      void reconcile(fileResultCountRef.current);
     } else {
       applySessionUpdate(session.id, result.session);
-      void reconcile(resultCountRef.current);
+      void reconcile(fileResultCountRef.current);
     }
   }, [applySessionUpdate, archiveView, dropSession, reconcile]);
 
@@ -1168,11 +1226,12 @@ function App() {
     : periodLabel;
   // "지금 뭐가 걸려 있나"를 설명하던 문장들을 버리고 초기화 버튼 하나로 줄인다.
   const filtersActive = Boolean(query) || statusFilters.length > 0 || archiveView !== 'current'
-    || Boolean(folder) || period !== DEFAULT_PERIOD;
+    || Boolean(folder) || period !== DEFAULT_PERIOD || liveOnly;
   const resetFilters = () => {
     setQuery('');
     setStatusFilters([]);
     setArchiveView('current');
+    setLiveOnly(false);
     setFolder('');
     setPeriod(DEFAULT_PERIOD);
     setCustomFrom('');
@@ -1190,6 +1249,7 @@ function App() {
         </button>
         <div className="topbar-actions">
           <span className={summary?.indexing ? 'system-status is-busy' : 'system-status'}><i /> {summary?.indexing ? `인덱싱 ${progress}%` : 'INDEX READY'}</span>
+          {summary?.liveCount > 0 ? <span className="live-count">실행 중 {number.format(summary.liveCount)}</span> : null}
           <button className="refresh-button" type="button" onClick={refresh} disabled={loading} aria-busy={loading}>{loading ? '확인 중' : '다시 스캔'}</button>
         </div>
       </nav>
@@ -1247,6 +1307,17 @@ function App() {
                     <span>{item.label}</span>{item.value === 'all' ? null : <strong>{number.format(archiveCounts[item.value] || 0)}</strong>}
                   </button>
                 ))}
+              </div>
+              {/* 살아있음은 기계가 판정한 사실이라 사용자가 찍는 상태 칩과 같은 그룹에 두지 않는다. */}
+              <div className="chip-row" role="group" aria-label="실행 상태로 걸러보기">
+                <button
+                  className="filter-chip"
+                  type="button"
+                  aria-pressed={liveOnly}
+                  onClick={() => setLiveOnly((value) => !value)}
+                >
+                  <span>실행 중</span><strong>{number.format(summary?.liveCount || 0)}</strong>
+                </button>
               </div>
               <label>
                 <span>기간</span>
