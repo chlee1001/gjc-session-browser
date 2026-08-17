@@ -394,7 +394,8 @@ export function filterSessions(sessions, { query = '', folder = '', from = '', t
     if (folder && session.cwd !== folder) return false;
     if (from && session.lastActivity < from) return false;
     if (to && session.lastActivity > to) return false;
-    return terms.every((term) => session.searchText.includes(term));
+    // SDK 오버레이가 만든 세션은 searchText가 비어 있을 수 있다. 목록 전체가 500으로 죽지 않게 막는다.
+    return terms.every((term) => (session.searchText || '').includes(term));
   });
 }
 
