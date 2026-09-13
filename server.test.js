@@ -920,7 +920,7 @@ test('groups validate, persist, and filter file and live SDK sessions', { timeou
   });
   const list = async (query = '') => (await fetch(`${running.baseUrl}/api/sessions${query}`)).json();
   try {
-    assert.deepEqual((await list()).summary.groups, [{ id: savedId, name: 'Saved', count: 1 }]);
+    assert.deepEqual((await list()).summary.groups, [{ id: savedId, name: 'Saved', sessionIds: [fileId, 'missing'], count: 1 }]);
     const created = await request('/api/groups', 'POST', { name: ' Current ' });
     assert.equal(created.status, 201);
     const { group } = await created.json();
@@ -944,6 +944,22 @@ test('groups validate, persist, and filter file and live SDK sessions', { timeou
       assert.equal((await request(`/api/groups/${id}`, 'DELETE')).status, 400);
     }
     assert.equal((await request(`/api/groups/${unknownId}`, 'DELETE')).status, 404);
+    assert.equal((await request(`/api/groups/${unknownId}`, 'PATCH', { name: 'Missing' })).status, 404);
+    for (const name of ['', '  ', 'x'.repeat(61), 123, null]) {
+      const response = await request(`/api/groups/${group.id}`, 'PATCH', { name });
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).code, 'invalid_name');
+    }
+    const duplicateRename = await request(`/api/groups/${group.id}`, 'PATCH', { name: ' SAVED ' });
+    assert.equal(duplicateRename.status, 409);
+    assert.equal((await duplicateRename.json()).code, 'duplicate_group_name');
+    const malformedRename = await fetch(`${running.baseUrl}/api/groups/${group.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{',
+    });
+    assert.equal(malformedRename.status, 400);
+    assert.equal((await malformedRename.json()).code, 'invalid_body');
+    assert.equal((await request(`/api/groups/${group.id}`, 'POST', { name: 'Wrong method' })).status, 405);
+    assert.equal((await request('/api/groups/bad', 'PATCH', { name: 'Invalid ID' })).status, 400);
     assert.equal((await request(`/api/groups/${unknownId}/sessions`, 'PUT', { ids: [fileId], member: true })).status, 404);
     assert.equal((await fetch(`${running.baseUrl}/api/sessions?group=bad`)).status, 400);
     assert.equal((await fetch(`${running.baseUrl}/api/sessions?group=${unknownId}`)).status, 404);
@@ -976,6 +992,30 @@ test('groups validate, persist, and filter file and live SDK sessions', { timeou
     const added = await request(memberRoute, 'PUT', { ids: [fileId, liveId, fileId], member: true });
     assert.equal(added.status, 200);
     assert.deepEqual((await added.json()).group.sessionIds, [fileId, liveId]);
+    const renameRoute = `/api/groups/${group.id}`;
+    const beforeRenameFailure = await list();
+    await chmod(path.dirname(configPath), 0o500);
+    let failedRename;
+    try {
+      failedRename = await request(renameRoute, 'PATCH', { name: 'Not saved' });
+    } finally {
+      await chmod(path.dirname(configPath), 0o700);
+    }
+    assert.equal(failedRename.status, 500);
+    const afterRenameFailure = await list();
+    assert.deepEqual(afterRenameFailure.summary.groups, beforeRenameFailure.summary.groups);
+    assert.equal(afterRenameFailure.summary.modelRevision, beforeRenameFailure.summary.modelRevision);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).sessionGroups.find((entry) => entry.id === group.id),
+      { id: group.id, name: 'Current', sessionIds: [fileId, liveId] });
+    const renamed = await request(renameRoute, 'PATCH', { name: ' Renamed ' });
+    assert.equal(renamed.status, 200);
+    assert.deepEqual((await renamed.json()).group, { id: group.id, name: 'Renamed', sessionIds: [fileId, liveId] });
+    assert.deepEqual((await list()).summary.groups.find((entry) => entry.id === group.id),
+      { id: group.id, name: 'Renamed', sessionIds: [fileId, liveId], count: 2 });
+    const renameRevision = (await list()).summary.modelRevision;
+    assert.equal((await request(renameRoute, 'PATCH', { name: 'Renamed' })).status, 200);
+    assert.equal((await list()).summary.modelRevision, renameRevision, 'no-op rename does not rotate revision');
+    assert.equal((await request(renameRoute, 'PATCH', { name: 'RENAMED' })).status, 200, 'same group may change case');
     await request(`/api/archive/${fileId}`, 'PUT', { archived: true });
     const scoped = await list(`?group=${group.id}`);
     assert.deepEqual(scoped.sessions.map((session) => session.id), [liveId]);
@@ -993,7 +1033,8 @@ test('groups validate, persist, and filter file and live SDK sessions', { timeou
     assert.equal(summaryOnly.resultCount, 0);
     assert.equal(summaryOnly.summary.sessionCount, 0);
     assert.deepEqual(summaryOnly.summary.groups, [
-      { id: savedId, name: 'Saved', count: 1 }, { id: group.id, name: 'Current', count: 2 },
+      { id: savedId, name: 'Saved', sessionIds: [fileId, 'missing'], count: 1 },
+      { id: group.id, name: 'RENAMED', sessionIds: [fileId, liveId], count: 2 },
     ], 'group counts ignore group, date, status, and archive filters');
     assert.equal((await request(memberRoute, 'PUT', { ids: [fileId], member: false })).status, 200);
     assert.equal((await list(`?group=${group.id}&archive=all`)).summary.sessionCount, 0);
@@ -1003,12 +1044,14 @@ test('groups validate, persist, and filter file and live SDK sessions', { timeou
     const persisted = JSON.parse(await readFile(configPath, 'utf8'));
     assert.deepEqual(persisted.sessionGroups, [
       { id: savedId, name: 'Saved', sessionIds: [fileId, 'missing'] },
-      { id: group.id, name: 'Current', sessionIds: [liveId] },
+      { id: group.id, name: 'RENAMED', sessionIds: [liveId] },
     ]);
     assert.equal('focusedSessionIds' in persisted, false);
     running.server.kill('SIGTERM');
     await new Promise((resolve) => running.server.once('exit', resolve));
     running = await startOverlayServer(options);
+    assert.deepEqual((await list()).summary.groups.find((entry) => entry.id === group.id),
+      { id: group.id, name: 'RENAMED', sessionIds: [liveId], count: 1 });
     assert.deepEqual((await list(`?group=${group.id}`)).sessions.map((session) => session.id), [liveId]);
     assert.deepEqual(await (await request(`/api/groups/${group.id}`, 'DELETE')).json(), { removed: true });
     assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).sessionGroups,
@@ -1143,6 +1186,7 @@ test('브로커가 ok:false면 500이 아니라 조용히 degrade한다', { time
     assert.equal(response.status, 200);
     const listing = await response.json();
     assert.equal(listing.summary.liveCount, 0);
+    assert.equal(listing.summary.liveCheckHealthy, false, 'an unavailable SDK must not imply a confirmed absence of connections');
     assert.equal(listing.resultCount, 1);
     assert.equal(listing.fileResultCount, 1);
     assert.equal(listing.sdkOnlyCount, 0);

@@ -413,7 +413,7 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
   );
 }
 
-function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onCloseConnection, onSetStatus, onArchive }) {
+function SessionDetail({ selected, detail, loading, error, mutationDisabled, liveCheckHealthy, groups, groupSubmitting, onGroupMembership, onClose, onRename, onDelete, onCloseConnection, onSetStatus, onArchive }) {
   const [title, setTitle] = useState('');
   const [saving, setSaving] = useState(false);
   const [statusSaving, setStatusSaving] = useState(false);
@@ -554,6 +554,22 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
           <button ref={closeRef} className="detail-close" type="button" onClick={onClose} aria-label="상세 정보 닫기">×</button>
         </header>
 
+        <section className="detail-connection" aria-label="GJC 프로세스 연결">
+          <button className="connection-close" type="button" aria-describedby="detail-connection-help" onClick={() => setConfirmingClose(true)} disabled={!session.live || !liveCheckHealthy || closingConnection || deleting}>연결 종료</button>
+          <p id="detail-connection-help" className="archive-helper">{!liveCheckHealthy ? '연결 상태 확인 불가 · GJC SDK에서 연결 정보를 확인하지 못했습니다. 세션 기록 삭제와는 별개입니다.' : session.live ? 'GJC 프로세스만 종료합니다. 세션 기록과 그룹 설정은 유지됩니다.' : '현재 연결된 GJC 프로세스가 없습니다. 세션 기록 삭제와는 별개입니다.'}</p>
+          {session.live && confirmingClose ? (
+            <section className="connection-confirm" aria-label="세션 연결 종료 확인">
+              <div>
+                <strong>GJC 프로세스를 종료할까요?</strong>
+                <p>PID {session.pid || '정보 없음'} · 세션 기록과 그룹 설정은 그대로 남습니다.</p>
+              </div>
+              <div>
+                <button type="button" onClick={() => setConfirmingClose(false)} disabled={closingConnection}>취소</button>
+                <button className="confirm-close" type="button" onClick={() => void closeConnection()} disabled={closingConnection || !liveCheckHealthy}>{closingConnection ? '종료 중' : '프로세스 종료'}</button>
+              </div>
+            </section>
+          ) : null}
+        </section>
         {loading ? <div className="detail-state">세션 원본을 읽고 있습니다.</div> : null}
         {error ? <div className="detail-state is-error">{error}</div> : null}
         {!loading && !error && detail ? (
@@ -577,21 +593,24 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
                 })}
               </div>
               <button className="row-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')} disabled={closingConnection}>{session.archived ? '복원' : '보관'}</button>
-              {session.live ? <button className="connection-close" type="button" onClick={() => setConfirmingClose(true)} disabled={closingConnection || deleting}>연결 종료</button> : null}
             </div>
             <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
-            {session.live && confirmingClose ? (
-              <section className="connection-confirm" aria-label="세션 연결 종료 확인">
-                <div>
-                  <strong>GJC 프로세스를 종료할까요?</strong>
-                  <p>PID {session.pid || '정보 없음'} · 세션 기록과 그룹 설정은 그대로 남습니다.</p>
-                </div>
-                <div>
-                  <button type="button" onClick={() => setConfirmingClose(false)} disabled={closingConnection}>취소</button>
-                  <button className="confirm-close" type="button" onClick={() => void closeConnection()} disabled={closingConnection}>{closingConnection ? '종료 중' : '프로세스 종료'}</button>
-                </div>
-              </section>
-            ) : null}
+            <section className="detail-groups" aria-label="세션 그룹 멤버십" aria-busy={groupSubmitting}>
+              <h3>그룹</h3>
+              {groups.length ? groups.map((item) => {
+                const member = item.sessionIds.includes(session.id);
+                return (
+                  <button className="group-filter" key={item.id} type="button" aria-pressed={member} aria-label={`${item.name} 그룹 ${member ? '제외' : '추가'}`} disabled={groupSubmitting || deleting || closingConnection || mutationDisabled} onClick={async () => {
+                    setMutationError('');
+                    try { await onGroupMembership(session.id, item.id, !member); }
+                    catch (membershipError) { setMutationError(membershipError.message); }
+                  }}>
+                    <span>{item.name}</span><strong>{member ? '포함됨 · 제외' : '추가'}</strong>
+                  </button>
+                );
+              }) : <p className="archive-helper">사이드바에서 그룹을 만들면 이 세션을 추가할 수 있습니다.</p>}
+              {groupSubmitting ? <p role="status">그룹 저장 중</p> : null}
+            </section>
             <form className="rename-form" onSubmit={rename}>
               <label><span>세션 제목</span><input name="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || closingConnection || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
               <button type="submit" aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={saving || deleting || closingConnection || mutationDisabled || session.sdkOnly || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
@@ -710,6 +729,8 @@ function App() {
   const [groupTarget, setGroupTarget] = useState('');
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [groupError, setGroupError] = useState('');
+  const [editingGroup, setEditingGroup] = useState(null);
+  const groupMutationRef = useRef(false);
   const [announcement, setAnnouncement] = useState('');
   const [undo, setUndo] = useState(null);
   const [undoSubmitting, setUndoSubmitting] = useState(false);
@@ -1274,6 +1295,68 @@ function App() {
     }
   };
 
+  const renameGroup = async (event) => {
+    event.preventDefault();
+    const name = editingGroup?.name.trim();
+    if (!name || groupMutationRef.current || groupSubmitting) return;
+    groupMutationRef.current = true;
+    setGroupSubmitting(true);
+    setGroupError('');
+    try {
+      const response = await fetch(`/api/groups/${encodeURIComponent(editingGroup.id)}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '그룹 이름을 변경하지 못했습니다.');
+      ++listGenerationRef.current;
+      setSummary((current) => current ? {
+        ...current, groups: current.groups.map((item) => item.id === result.group.id ? { ...item, ...result.group } : item),
+      } : current);
+      setEditingGroup(null);
+      setAnnouncement(`${result.group.name} 그룹으로 이름을 변경했습니다`);
+      void reconcile(fileResultCountRef.current);
+    } catch (renameError) {
+      setGroupError(renameError.message);
+    } finally {
+      groupMutationRef.current = false;
+      setGroupSubmitting(false);
+    }
+  };
+
+  const updateDetailGroupMembership = async (sessionId, groupId, member) => {
+    if (groupMutationRef.current || groupSubmitting) return;
+    groupMutationRef.current = true;
+    setGroupSubmitting(true);
+    try {
+      const response = await fetch(`/api/groups/${encodeURIComponent(groupId)}/sessions`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [sessionId], member }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '그룹 구성을 변경하지 못했습니다.');
+      ++listGenerationRef.current;
+      setSummary((current) => current ? {
+        ...current,
+        groups: current.groups.map((item) => item.id === groupId ? {
+          ...item, ...result.group,
+          count: Math.max(0, item.count + (item.sessionIds.includes(sessionId) === member ? 0 : member ? 1 : -1)),
+        } : item),
+      } : current);
+      if (!member && group === groupId) {
+        const removed = sessionsRef.current.find((session) => session.id === sessionId);
+        dropSession(sessionId, false);
+        if (removed) {
+          setResultCount((count) => Math.max(0, count - 1));
+          if (!removed.sdkOnly) fileResultCountRef.current -= 1;
+        }
+      }
+      setAnnouncement(`${result.group.name} 그룹${member ? '에 추가했습니다' : '에서 제외했습니다'}`);
+      await reconcile(fileResultCountRef.current);
+    } finally {
+      groupMutationRef.current = false;
+      setGroupSubmitting(false);
+    }
+  };
+
   const deleteGroup = async (item) => {
     if (!window.confirm(`"${item.name}" 그룹을 삭제할까요? 세션 자체는 삭제되지 않습니다.`)) return;
     setGroupSubmitting(true);
@@ -1549,7 +1632,15 @@ function App() {
                       <button className="group-filter" type="button" aria-pressed={group === item.id} onClick={() => setGroup(item.id)}>
                         <span>{item.name}</span><strong>{number.format(item.count || 0)}</strong>
                       </button>
+                      <button className="group-rename" type="button" disabled={groupSubmitting} onClick={() => { setEditingGroup({ id: item.id, name: item.name }); setGroupError(''); }} aria-label={`${item.name} 그룹 이름 변경`}>이름 변경</button>
                       <button className="group-delete" type="button" disabled={groupSubmitting} onClick={() => void deleteGroup(item)} aria-label={`${item.name} 그룹 삭제`}>×</button>
+                      {editingGroup?.id === item.id ? (
+                        <form className="group-form group-rename-form" onSubmit={renameGroup} aria-busy={groupSubmitting}>
+                          <label><span>그룹 이름 변경</span><input autoFocus name="rename-group" value={editingGroup.name} maxLength={60} disabled={groupSubmitting} aria-invalid={Boolean(groupError)} onChange={(event) => setEditingGroup({ ...editingGroup, name: event.target.value })} onKeyDown={(event) => { if (event.key === 'Escape' && !groupSubmitting) setEditingGroup(null); }} /></label>
+                          <button type="submit" disabled={groupSubmitting || !editingGroup.name.trim()}>{groupSubmitting ? '저장 중' : '이름 저장'}</button>
+                          <button type="button" disabled={groupSubmitting} onClick={() => { setEditingGroup(null); setGroupError(''); }}>취소</button>
+                        </form>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -1623,7 +1714,7 @@ function App() {
       </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
-      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onCloseConnection={closeSessionConnection} onSetStatus={setSessionStatus} onArchive={archiveSession} />
+      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} liveCheckHealthy={summary?.liveCheckHealthy} groups={groups} groupSubmitting={groupSubmitting} onGroupMembership={updateDetailGroupMembership} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onCloseConnection={closeSessionConnection} onSetStatus={setSessionStatus} onArchive={archiveSession} />
       {activeModel ? <ModelSessions key={activeModel.id} model={activeModel} from={modelRange.from} to={modelRange.to} group={group} revision={modelRevision} onClose={closeModelSessions} onSelect={openSessionFromModel} /> : null}
     </div>
   );

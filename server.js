@@ -917,8 +917,9 @@ async function handleApi(request, response) {
       const collection = url.pathname === '/api/groups';
       const parts = url.pathname.slice('/api/groups/'.length).split('/');
       const membership = !collection && parts.length === 2 && parts[1] === 'sessions';
+      const rename = !collection && parts.length === 1 && request.method === 'PATCH';
       if (!collection && !membership && parts.length !== 1) throw groupError(400, 'malformed_group_id');
-      if (request.method !== (collection ? 'POST' : membership ? 'PUT' : 'DELETE')) {
+      if (!rename && request.method !== (collection ? 'POST' : membership ? 'PUT' : 'DELETE')) {
         sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
         return true;
       }
@@ -929,25 +930,31 @@ async function handleApi(request, response) {
         requireGroup(sessionGroups, id);
       }
       let body;
-      if (collection || membership) {
+      if (collection || membership || rename) {
         try { body = await readBody(request); } catch (error) {
           if (error.code === 'body_too_large') throw error;
           throw groupError(400, 'invalid_body');
         }
       }
       let group;
-      if (collection) {
+      if (collection || rename) {
         const name = typeof body?.name === 'string' ? body.name.trim() : '';
         if (!name || name.length > 60) throw groupError(400, 'invalid_name');
         await mutateConfig((draft) => {
-          if (draft.sessionGroups.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) {
+          if (rename) group = requireGroup(draft.sessionGroups, id);
+          if (draft.sessionGroups.some((entry) => entry.id !== group?.id && entry.name.toLowerCase() === name.toLowerCase())) {
             throw groupError(409, 'duplicate_group_name');
+          }
+          if (rename) {
+            const changed = group.name !== name;
+            group.name = name;
+            return { changed };
           }
           group = { id: randomUUID(), name, sessionIds: [] };
           draft.sessionGroups.push(group);
           return { changed: true };
         });
-        sendJson(response, 201, { group });
+        sendJson(response, collection ? 201 : 200, { group });
       } else if (membership) {
         if (!Array.isArray(body?.ids) || !body.ids.length
           || body.ids.some((sessionId) => typeof sessionId !== 'string' || !sessionId.length)) {
@@ -1470,6 +1477,7 @@ async function handleApi(request, response) {
     summary.groups = sessionGroups.map((group) => ({
       id: group.id,
       name: group.name,
+      sessionIds: [...group.sessionIds],
       count: group.sessionIds.filter((id) => knownIds.has(id)).length,
     }));
     // 폴더 옵션에는 SDK-only 세션의 cwd도 들어가야 그 폴더로 걸러볼 수 있다.
@@ -1495,7 +1503,7 @@ async function handleApi(request, response) {
         liveCount,
         liveSessionIds: scopedByFilters.filter((session) => session.live).map((session) => session.id),
         liveCheckedAt: sdkCache.fetchedAt ? new Date(sdkCache.fetchedAt).toISOString() : '',
-        liveCheckHealthy: sdkCache.failures < 2,
+        liveCheckHealthy: sdkCache.fetchedAt > 0 && sdkCache.failures === 0,
       },
       resultCount: filtered.length,
       fileResultCount,
