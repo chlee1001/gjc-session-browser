@@ -31,6 +31,7 @@ const SDK_IDLE_TTL_MS = 30000;
 let sdkCache = { fetchedAt: 0, sessions: [], failures: 0 };
 let sdkInflight = null;
 let sdkGeneration = 0;
+let sdkHasSuccessfulSnapshot = false;
 const sdkFirstSeenAt = new Map();
 let sessionStatus = new Map();
 let sessionMap = new Map();
@@ -318,6 +319,7 @@ function sdkSnapshot(forceRefresh = false) {
     sdkInflight = sdkSessionList().then((sessions) => {
       if (generation !== sdkGeneration) return;
       if (sessions) {
+        sdkHasSuccessfulSnapshot = true;
         const seenIds = new Set();
         const now = Date.now();
         for (const entry of sessions) {
@@ -1517,7 +1519,9 @@ async function handleApi(request, response) {
         liveCount,
         liveSessionIds: scopedByFilters.filter((session) => session.live).map((session) => session.id),
         liveCheckedAt: sdkCache.fetchedAt ? new Date(sdkCache.fetchedAt).toISOString() : '',
-        liveCheckHealthy: sdkCache.fetchedAt > 0 && sdkCache.failures === 0,
+        // 직전 정상 스냅샷이 있으면 한 번의 일시적 CLI 실패는 기존 값을 유지한다.
+        // 성공 이력이 없거나 연속 두 번 실패했을 때만 연결 확인 지연으로 내린다.
+        liveCheckHealthy: sdkHasSuccessfulSnapshot && sdkCache.failures < 2,
       },
       resultCount: filtered.length,
       fileResultCount,

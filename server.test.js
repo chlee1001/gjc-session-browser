@@ -1190,9 +1190,9 @@ test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없�
     let failed = await (await fetch(`${baseUrl}/api/sessions?refresh=1`)).json();
     for (let attempt = 0; failed.summary.liveCheckHealthy && attempt < 80; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 50));
-      failed = await (await fetch(`${baseUrl}/api/sessions`)).json();
+      failed = await (await fetch(`${baseUrl}/api/sessions?refresh=1`)).json();
     }
-    assert.equal(failed.summary.liveCheckHealthy, false, 'a failed refresh must not remain healthy');
+    assert.equal(failed.summary.liveCheckHealthy, false, 'consecutive failed refreshes must not remain healthy');
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));
