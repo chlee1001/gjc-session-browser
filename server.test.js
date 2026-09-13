@@ -861,6 +861,14 @@ test('session close requires a successful broker envelope and preserves live sta
   const sdkPayload = { ok: true, result: { sessions: [sdkEntry({ id: 'live', repo: home })] } };
   const { server, baseUrl } = await startOverlayServer({ home, sdkPayload });
   try {
+    await writeSdkStub(home, sdkPayload, {
+      closePayload: { ok: false, error: { code: 'terminal_uncertain' } },
+      closeExitCode: 1,
+    });
+    const uncertain = await fetch(`${baseUrl}/api/sessions/live/close`, { method: 'POST' });
+    assert.equal(uncertain.status, 409);
+    assert.equal((await uncertain.json()).code, 'session_uncertain');
+
     for (const closeOptions of [
       { closePayload: { ok: false, error: { code: 'close_denied' } } },
       { closePayload: { result: { closed: true } } },
@@ -1120,6 +1128,18 @@ test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없�
     assert.equal(listing.sdkOnlyCount, 1);
     assert.equal(listing.summary.liveCount, 2);
 
+    const refreshing = await (await fetch(`${baseUrl}/api/sessions?refresh=1`)).json();
+    assert.equal(refreshing.summary.liveCheckHealthy, true);
+    assert.equal(refreshing.summary.liveCount, listing.summary.liveCount);
+    assert.equal(refreshing.summary.liveCheckedAt, listing.summary.liveCheckedAt);
+    let refreshed = refreshing;
+    for (let attempt = 0; refreshed.summary.liveCheckedAt === refreshing.summary.liveCheckedAt && attempt < 80; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      refreshed = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    }
+    assert.ok(Date.parse(refreshed.summary.liveCheckedAt) > Date.parse(refreshing.summary.liveCheckedAt), 'refresh must complete a new SDK list call');
+    assert.equal(refreshed.summary.liveCheckHealthy, true);
+
     // live 필터는 살아있는 것만 남긴다.
     const liveListing = await (await fetch(`${baseUrl}/api/sessions?live=1`)).json();
     assert.equal(liveListing.resultCount, 2);
@@ -1165,6 +1185,14 @@ test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없�
     const detail = await fetch(`${baseUrl}/api/sessions/${orphanId}`);
     assert.equal(detail.status, 200);
     assert.equal((await detail.json()).lastExchange, null);
+
+    await writeSdkOffStub(home);
+    let failed = await (await fetch(`${baseUrl}/api/sessions?refresh=1`)).json();
+    for (let attempt = 0; failed.summary.liveCheckHealthy && attempt < 80; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      failed = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    }
+    assert.equal(failed.summary.liveCheckHealthy, false, 'a failed refresh must not remain healthy');
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));

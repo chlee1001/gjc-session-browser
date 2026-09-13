@@ -1234,13 +1234,28 @@ async function handleApi(request, response) {
         sendJson(response, 404, { code: 'session_offline', error: '연결된 세션을 찾을 수 없습니다.' });
         return true;
       }
-      const { stdout } = await runFile(
-        process.env.GJC_SDK_CLI || 'gjc',
-        ['sdk', 'session', 'raw', 'global', '--op', 'session.close', '--json-input', JSON.stringify({ sessionId }), '--idempotency-key', randomUUID()],
-        // 브로커의 graceful close와 SIGTERM fallback이 끝날 시간을 확보한다.
-        { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
-      );
-      if (JSON.parse(stdout)?.ok !== true) throw new Error('close_failed');
+      let closeResult;
+      let closeCommandFailed = false;
+      try {
+        const { stdout } = await runFile(
+          process.env.GJC_SDK_CLI || 'gjc',
+          ['sdk', 'session', 'raw', 'global', '--op', 'session.close', '--json-input', JSON.stringify({ sessionId }), '--idempotency-key', randomUUID()],
+          // 브로커의 graceful close와 SIGTERM fallback이 끝날 시간을 확보한다.
+          { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        closeResult = JSON.parse(stdout);
+      } catch (closeError) {
+        closeCommandFailed = true;
+        try { closeResult = JSON.parse(String(closeError.stdout || '')); } catch {}
+        if (!closeResult) throw closeError;
+      }
+      if (closeResult?.error?.code === 'terminal_uncertain') {
+        sendJson(response, 409, { code: 'session_uncertain', error: '세션 소유권이 불확실하여 안전하게 종료할 수 없습니다. 라이브 상태를 다시 확인해 주세요.' });
+        return true;
+      }
+      if (closeCommandFailed || closeResult?.ok !== true) {
+        throw new Error('close_failed');
+      }
       // 종료 전에 시작된 목록 갱신이 성공 결과를 다시 LIVE로 덮어쓰지 못하게 한다.
       sdkGeneration += 1;
       sdkCache = { ...sdkCache, fetchedAt: Date.now(), sessions: sdkCache.sessions.filter((entry) => entry.sessionId !== sessionId) };
@@ -1422,8 +1437,7 @@ async function handleApi(request, response) {
     const forceRefresh = url.searchParams.get('refresh') === '1';
     await initializeIndex(forceRefresh);
     // "다시 스캔"은 SDK 상태까지 지금 것으로 보자는 뜻이다.
-    if (forceRefresh) sdkCache = { ...sdkCache, fetchedAt: 0 };
-    const sdk = sdkSnapshot();
+    const sdk = sdkSnapshot(forceRefresh);
     const fileSessions = sessionsSorted().map((session) => withSdkOverlay(session, sdk.get(session.id)));
     // 합집합은 여기 한 번만 만들고, 이후 필터·집계·정렬·페이지 나누기는 손대지 않는다.
     const allSessions = [...fileSessions, ...sdkOnlyRows(sdk)];
