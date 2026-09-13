@@ -27,7 +27,7 @@ kbd { font-family: var(--font-mono); }
 .bulk-bar button, .bulk-bar label, .group-filter, .group-delete, .group-form input, .group-form button,
 .model-usage > header button, .model-open,
 .session-mark, .row-archive, .detail-close, .detail-grid button, .rename-form input, .rename-form button,
-.danger-zone button, .delete-confirm input, .remaining-paths button, .partial-delete-actions button,
+.connection-close, .connection-confirm button, .danger-zone button, .delete-confirm input, .remaining-paths button, .partial-delete-actions button,
 .stale-panel button, .model-session-more, .model-session-row { min-height: var(--control-h); }
 
 .app-shell { min-height: 100dvh; }
@@ -246,7 +246,14 @@ details.filter-block { display: block; padding-bottom: 0; }
 .detail-status .session-status { flex: none; }
 .detail-status .session-mark { padding: 0 var(--space-md); font: 600 var(--text-sm)/1 var(--font-body); }
 .detail-status .row-archive { padding: 0 var(--space-md); font: 600 var(--text-sm)/1 var(--font-body); }
+.connection-close { border: var(--rule-thin) solid var(--color-danger); border-radius: var(--radius-sm); padding: 0 var(--space-md); color: var(--color-danger); background: var(--color-paper); font-size: var(--text-sm); font-weight: 600; white-space: nowrap; }
 .archive-helper { margin: calc(var(--space-md) * -1) 0 0; color: var(--color-muted); font-size: var(--text-xs); }
+.connection-confirm { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-md); padding: var(--space-md); border: var(--rule-thin) solid var(--color-danger); border-radius: var(--radius-sm); background: var(--color-danger-soft); }
+.connection-confirm strong { color: var(--color-ink); }
+.connection-confirm p { margin: var(--space-xs) 0 0; color: var(--color-muted); font-size: var(--text-sm); }
+.connection-confirm > div:last-child { display: flex; gap: var(--space-sm); }
+.connection-confirm button { border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-sm); padding: 0 var(--space-md); color: var(--color-ink); background: var(--color-paper); font-size: var(--text-sm); white-space: nowrap; }
+.connection-confirm .confirm-close { border-color: var(--color-danger); color: var(--color-paper); background: var(--color-danger); }
 .rename-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-sm); }
 .rename-form label { display: grid; gap: var(--space-xs); min-width: 0; }
 .rename-form label span { color: var(--color-muted); font: 500 var(--text-xs)/1.2 var(--font-mono); }
@@ -340,6 +347,8 @@ details.filter-block { display: block; padding-bottom: 0; }
   .rename-form input:hover { border-color: var(--color-accent); }
   .rename-form button:hover { opacity: .88; }
   .danger-zone > button:hover { color: var(--color-paper); background: var(--color-danger); }
+  .connection-close:hover { color: var(--color-paper); background: var(--color-danger); }
+  .connection-confirm button:hover { border-color: var(--color-danger); }
   .delete-confirm button:hover { border-color: var(--color-danger); color: var(--color-danger); }
   .delete-confirm .confirm-delete:hover { color: var(--color-paper); opacity: .88; }
   .command-item:hover { border-color: var(--color-rule); background: var(--color-accent-soft); }
@@ -393,6 +402,7 @@ details.filter-block { display: block; padding-bottom: 0; }
   .rename-form, .danger-zone { grid-template-columns: minmax(0, 1fr); }
   .danger-zone { align-items: stretch; }
   .danger-zone > button { width: 100%; }
+  .connection-confirm, .connection-confirm > div:last-child { align-items: stretch; flex-direction: column; }
   .delete-confirm { justify-items: stretch; }
   .delete-confirm p { text-align: left; }
   .model-session-row { grid-template-columns: minmax(0, 1fr); align-items: start; gap: var(--space-sm); }

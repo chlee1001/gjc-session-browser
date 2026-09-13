@@ -413,11 +413,13 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
   );
 }
 
-function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onSetStatus, onArchive }) {
+function SessionDetail({ selected, detail, loading, error, mutationDisabled, onClose, onRename, onDelete, onCloseConnection, onSetStatus, onArchive }) {
   const [title, setTitle] = useState('');
   const [saving, setSaving] = useState(false);
   const [statusSaving, setStatusSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [closingConnection, setClosingConnection] = useState(false);
+  const [confirmingClose, setConfirmingClose] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [mutationError, setMutationError] = useState('');
   const [preflight, setPreflight] = useState(null);
@@ -436,6 +438,8 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     setConfirmingDelete(false);
     setStatusSaving(false);
     setDeleting(false);
+    setClosingConnection(false);
+    setConfirmingClose(false);
     setSaving(false);
     setMutationError('');
     setPreflight(null);
@@ -528,6 +532,18 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
     }
   };
 
+  const closeConnection = async () => {
+    setClosingConnection(true);
+    setMutationError('');
+    try {
+      await onCloseConnection(session);
+      setConfirmingClose(false);
+    } catch (closeError) {
+      setMutationError(closeError.message);
+    } finally {
+      setClosingConnection(false);
+    }
+  };
 
   return (
     <div className="detail-layer">
@@ -553,19 +569,32 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
                       type="button"
                       aria-pressed={on}
                       onClick={() => changeStatus(on ? 'none' : item.value)}
-                      disabled={statusSaving || deleting}
+                      disabled={statusSaving || deleting || closingConnection}
                     >
                       {item.label}
                     </button>
                   );
                 })}
               </div>
-              <button className="row-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')}>{session.archived ? '복원' : '보관'}</button>
+              <button className="row-archive" type="button" aria-describedby="detail-archive-help" onClick={() => onArchive(session, !session.archived, 'detail')} disabled={closingConnection}>{session.archived ? '복원' : '보관'}</button>
+              {session.live ? <button className="connection-close" type="button" onClick={() => setConfirmingClose(true)} disabled={closingConnection || deleting}>연결 종료</button> : null}
             </div>
             <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
+            {session.live && confirmingClose ? (
+              <section className="connection-confirm" aria-label="세션 연결 종료 확인">
+                <div>
+                  <strong>GJC 프로세스를 종료할까요?</strong>
+                  <p>PID {session.pid || '정보 없음'} · 세션 기록과 그룹 설정은 그대로 남습니다.</p>
+                </div>
+                <div>
+                  <button type="button" onClick={() => setConfirmingClose(false)} disabled={closingConnection}>취소</button>
+                  <button className="confirm-close" type="button" onClick={() => void closeConnection()} disabled={closingConnection}>{closingConnection ? '종료 중' : '프로세스 종료'}</button>
+                </div>
+              </section>
+            ) : null}
             <form className="rename-form" onSubmit={rename}>
-              <label><span>세션 제목</span><input name="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
-              <button type="submit" aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={saving || deleting || mutationDisabled || session.sdkOnly || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
+              <label><span>세션 제목</span><input name="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || closingConnection || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
+              <button type="submit" aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={saving || deleting || closingConnection || mutationDisabled || session.sdkOnly || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
               {/* 비활성 사유를 스크린리더가 읽을 수 있어야 한다. 시각적으로도 남긴다. */}
               {session.sdkOnly ? <p id="sdk-only-help" className="archive-helper">기록 파일이 아직 없어 제목 변경과 삭제를 쓸 수 없습니다.</p> : null}
             </form>
@@ -581,7 +610,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
               <div><dt>토큰 · 비용</dt><dd>{number.format(session.totalTokens)} · {money.format(session.cost)}</dd></div>
               <div><dt>서브에이전트 몫</dt><dd>{session.subagentTokens ? `${number.format(session.subagentTokens)} · ${money.format(session.subagentCost)}` : '없음'}</dd></div>
               {session.live ? <div><dt>프로세스</dt><dd>{session.pid ? `PID ${session.pid}` : '—'}</dd></div> : null}
-              {session.live ? <div><dt>실시간</dt><dd>실행 중 · {formatRelative(session.lastActivity)}</dd></div> : null}
+              {session.live ? <div><dt>브로커</dt><dd>연결됨</dd></div> : null}
               {/* 목록에 보이면 그리로 갈 길을 같이 둔다. */}
               {session.live ? <div><dt>이어서 열기</dt><CopyableValue label="세션 이어서 열기 명령" value={`gjc --session ${session.id}`} /></div> : null}
             </dl>
@@ -610,7 +639,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             <section className="danger-zone">
               <div><h3>세션 삭제</h3><p>세션 기록과 연결된 아티팩트를 영구 삭제합니다.</p></div>
               {!confirmingDelete ? (
-                <button ref={deleteRevealRef} type="button" onClick={revealDelete} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={mutationDisabled || session.sdkOnly}>삭제</button>
+                <button ref={deleteRevealRef} type="button" onClick={revealDelete} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={closingConnection || mutationDisabled || session.sdkOnly}>삭제</button>
               ) : (
                 <div className="delete-confirm">
                   <p>삭제 후 복구할 수 없습니다. 아래 범위를 영구 삭제합니다.</p>
@@ -1089,6 +1118,26 @@ function App() {
     setRequestKey((key) => key + 1);
     requestAnimationFrame(() => resultsHeadingRef.current?.focus());
   }, [dropSession]);
+
+  const closeSessionConnection = useCallback(async (session) => {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/close`, { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '세션 연결을 종료하지 못했습니다.');
+
+    if (session.sdkOnly || liveOnly) {
+      dropSession(session.id, true);
+      setResultCount((count) => Math.max(0, count - 1));
+    } else {
+      applySessionUpdate(session.id, { ...session, live: false, busy: false, ambiguous: false, pid: 0 });
+    }
+    setSummary((current) => current ? {
+      ...current,
+      liveCount: Math.max(0, (current.liveCount || 0) - 1),
+      liveSessionIds: (current.liveSessionIds || []).filter((id) => id !== session.id),
+    } : current);
+    setAnnouncement(`${session.title} 세션의 GJC 프로세스를 종료했습니다`);
+    void reconcile(fileResultCountRef.current);
+  }, [applySessionUpdate, dropSession, liveOnly, reconcile]);
 
   const setSessionStatus = useCallback(async (sessionId, next) => {
     const response = await fetch(`/api/status/${encodeURIComponent(sessionId)}`, {
@@ -1574,7 +1623,7 @@ function App() {
       </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
-      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onArchive={archiveSession} />
+      <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onCloseConnection={closeSessionConnection} onSetStatus={setSessionStatus} onArchive={archiveSession} />
       {activeModel ? <ModelSessions key={activeModel.id} model={activeModel} from={modelRange.from} to={modelRange.to} group={group} revision={modelRevision} onClose={closeModelSessions} onSelect={openSessionFromModel} /> : null}
     </div>
   );

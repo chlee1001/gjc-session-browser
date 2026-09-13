@@ -18,12 +18,28 @@ async function availablePort() {
  * 테스트는 실제 브로커를 타면 안 된다. 개발 머신에서 gjc가 PATH에 있으면 살아있는 세션이
  * 섞여 들어와 단언이 흔들린다. GJC_SDK_CLI로 이 스텁을 주입해 응답을 고정한다.
  */
-async function writeSdkStub(home, payload) {
+async function writeSdkStub(home, payload, { closePayload = { ok: true }, closeStdout, closeExitCode = 0 } = {}) {
   const stub = path.join(home, "sdk-stub.mjs");
   await writeFile(stub, `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
-writeFileSync(${JSON.stringify(path.join(home, 'sdk-args.json'))}, JSON.stringify(process.argv.slice(2)));
-process.stdout.write(JSON.stringify(${JSON.stringify(payload)}));
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+const closedPath = ${JSON.stringify(path.join(home, 'sdk-closed.json'))};
+const closed = existsSync(closedPath) ? JSON.parse(readFileSync(closedPath, 'utf8')) : [];
+appendFileSync(${JSON.stringify(path.join(home, 'sdk-invocations.jsonl'))}, JSON.stringify(args) + '\\n');
+if (args[2] === 'raw') {
+  const payload = ${JSON.stringify(closePayload)};
+  if (payload?.ok === true && ${closeExitCode} === 0 && ${JSON.stringify(closeStdout ?? null)} === null) {
+    closed.push(JSON.parse(args[args.indexOf('--json-input') + 1]).sessionId);
+    writeFileSync(closedPath, JSON.stringify(closed));
+  }
+  process.stdout.write(${JSON.stringify(closeStdout ?? null)} ?? JSON.stringify(payload));
+  process.exitCode = ${closeExitCode};
+} else {
+  writeFileSync(${JSON.stringify(path.join(home, 'sdk-args.json'))}, JSON.stringify(args));
+  const payload = ${JSON.stringify(payload)};
+  if (Array.isArray(payload?.result?.sessions)) payload.result.sessions = payload.result.sessions.filter((entry) => !closed.includes(entry?.sessionId));
+  process.stdout.write(JSON.stringify(payload));
+}
 `);
   await chmod(stub, 0o755);
   return stub;
@@ -700,7 +716,7 @@ test('삭제 뒤 설정 저장 실패도 원본 삭제를 되살리지 않고 �
 });
 
 /** SDK 오버레이 테스트용 최소 서버 기동 헬퍼. 세션 파일 하나와 SDK 응답을 주면 목록을 돌려준다. */
-async function startOverlayServer({ home, sessions = [], sdkPayload }) {
+async function startOverlayServer({ home, sessions = [], sdkPayload, closeOptions }) {
   const agentDirectory = path.join(home, 'agent');
   const sessionRoot = path.join(home, 'sessions');
   for (const entry of sessions) {
@@ -711,7 +727,7 @@ async function startOverlayServer({ home, sessions = [], sdkPayload }) {
       cwd: entry.cwd || home, title: entry.title || '파일 세션',
     })}\n`);
   }
-  const sdkStub = await writeSdkStub(home, sdkPayload);
+  const sdkStub = await writeSdkStub(home, sdkPayload, closeOptions);
   const port = await availablePort();
   const server = spawn(process.execPath, ['server.js'], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
@@ -741,6 +757,129 @@ async function startOverlayServer({ home, sessions = [], sdkPayload }) {
   }
   return { server, baseUrl, listing };
 }
+
+test('session close uses the broker and preserves file transcripts and config', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-close-'));
+  const fileId = 'close-file';
+  const sdkId = 'close-sdk";$(false)';
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sessions: [{ id: fileId, scope: 'scope' }],
+    sdkPayload: { ok: true, result: { sessions: [fileId, sdkId].map((id) => sdkEntry({ id, repo: home })) } },
+  });
+  try {
+    await fetch(`${baseUrl}/api/status/${fileId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+    });
+    const transcriptPath = path.join(home, 'sessions', 'scope', 'session.jsonl');
+    const configPath = path.join(home, '.gjc', 'session-list.json');
+    const transcript = await readFile(transcriptPath, 'utf8');
+    const config = await readFile(configPath, 'utf8');
+    const before = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    for (const sessionId of [fileId, sdkId]) {
+      const response = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/close`, { method: 'POST' });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { closed: true, sessionId });
+    }
+    const after = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    assert.equal(after.sessions.find((entry) => entry.id === fileId).live, false);
+    assert.equal(after.sessions.some((entry) => entry.id === sdkId), false);
+    assert.equal(after.summary.liveCount, 0);
+    assert.notEqual(after.summary.modelRevision, before.summary.modelRevision);
+    const detail = await (await fetch(`${baseUrl}/api/sessions/${fileId}`)).json();
+    assert.equal(detail.live, false);
+    assert.equal(detail.status, 'active');
+    assert.equal((await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(sdkId)}`)).status, 404);
+    assert.equal(await readFile(transcriptPath, 'utf8'), transcript);
+    assert.equal(await readFile(configPath, 'utf8'), config);
+    const calls = (await readFile(path.join(home, 'sdk-invocations.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const closes = calls.filter((args) => args[2] === 'raw');
+    assert.equal(closes.length, 2);
+    for (const [index, args] of closes.entries()) {
+      assert.deepEqual(args.slice(0, 9), [
+        'sdk', 'session', 'raw', 'global', '--op', 'session.close',
+        '--json-input', JSON.stringify({ sessionId: [fileId, sdkId][index] }), '--idempotency-key',
+      ]);
+      assert.equal(args.length, 10);
+      assert.match(args[9], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    }
+    assert.notEqual(closes[0][9], closes[1][9]);
+    assert.ok(calls.some((args) => JSON.stringify(args) === JSON.stringify(['sdk', 'session', 'list', '--scope', 'all'])));
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('session close rejects unsafe targets, malformed IDs and unsupported methods', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-close-reject-'));
+  const rows = [
+    sdkEntry({ id: 'live', repo: home }),
+    sdkEntry({ id: 'offline', repo: home, live: false }),
+    { ...sdkEntry({ id: 'deleted', repo: home }), deleted: true },
+    { ...sdkEntry({ id: 'uncertain', repo: home }), terminalUncertain: true },
+    { ...sdkEntry({ id: 'ambiguous', repo: home }), ambiguous: true },
+    sdkEntry({ id: 'duplicate', repo: home }),
+    sdkEntry({ id: 'duplicate', repo: home }),
+  ];
+  const { server, baseUrl } = await startOverlayServer({
+    home, sessions: [{ id: 'file-only', scope: 'scope' }],
+    sdkPayload: { ok: true, result: { sessions: rows } },
+  });
+  try {
+    for (const id of ['missing', 'file-only', 'offline', 'deleted']) {
+      assert.equal((await fetch(`${baseUrl}/api/sessions/${id}/close`, { method: 'POST' })).status, 404);
+    }
+    for (const id of ['uncertain', 'ambiguous', 'duplicate']) {
+      assert.equal((await fetch(`${baseUrl}/api/sessions/${id}/close`, { method: 'POST' })).status, 409);
+    }
+    for (const id of ['', '%', '%FF', 'a%2Fb', 'a/b', '%00', '%5C']) {
+      const response = await fetch(`${baseUrl}/api/sessions/${id}/close`, { method: 'POST' });
+      assert.equal(response.status, 400, id);
+      assert.equal((await response.json()).code, 'malformed_session_id');
+    }
+    for (const method of ['GET', 'PUT', 'DELETE', 'PATCH']) {
+      assert.equal((await fetch(`${baseUrl}/api/sessions/live/close`, { method })).status, 405);
+    }
+    // A live cached row must not authorize close once the current broker snapshot is offline.
+    await writeSdkStub(home, { ok: true, result: { sessions: [sdkEntry({ id: 'live', repo: home, live: false })] } });
+    assert.equal((await fetch(`${baseUrl}/api/sessions/live/close`, { method: 'POST' })).status, 404);
+    await writeSdkOffStub(home);
+    assert.equal((await fetch(`${baseUrl}/api/sessions/live/close`, { method: 'POST' })).status, 502);
+    const calls = (await readFile(path.join(home, 'sdk-invocations.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(calls.some((args) => args[2] === 'raw'), false);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('session close requires a successful broker envelope and preserves live state on failure', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-close-fail-'));
+  const sdkPayload = { ok: true, result: { sessions: [sdkEntry({ id: 'live', repo: home })] } };
+  const { server, baseUrl } = await startOverlayServer({ home, sdkPayload });
+  try {
+    for (const closeOptions of [
+      { closePayload: { ok: false, error: { code: 'close_denied' } } },
+      { closePayload: { result: { closed: true } } },
+      { closeStdout: 'broken JSON' },
+      { closeExitCode: 1 },
+    ]) {
+      await writeSdkStub(home, sdkPayload, closeOptions);
+      const response = await fetch(`${baseUrl}/api/sessions/live/close`, { method: 'POST' });
+      assert.equal(response.status, 502);
+      assert.equal((await response.json()).code, 'session_close_failed');
+      const detail = await (await fetch(`${baseUrl}/api/sessions/live`)).json();
+      assert.equal(detail.live, true);
+    }
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test('groups validate, persist, and filter file and live SDK sessions', { timeout: 45_000 }, async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'gjc-groups-'));

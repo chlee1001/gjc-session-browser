@@ -30,6 +30,7 @@ const SDK_LIVE_TTL_MS = 5000;
 const SDK_IDLE_TTL_MS = 30000;
 let sdkCache = { fetchedAt: 0, sessions: [], failures: 0 };
 let sdkInflight = null;
+let sdkGeneration = 0;
 const sdkFirstSeenAt = new Map();
 let sessionStatus = new Map();
 let sessionMap = new Map();
@@ -310,10 +311,12 @@ function sdkTtl() {
  * 현재 스냅샷을 즉시 돌려주고, 만료됐으면 갱신을 뒤에서 시작한다. 이 함수는 절대 await하지 않는다.
  * 동시 요청이 겹쳐도 in-flight 하나를 공유해 CLI를 중복 spawn하지 않는다.
  */
-function sdkSnapshot() {
-  const stale = Date.now() - sdkCache.fetchedAt >= sdkTtl();
+function sdkSnapshot(forceRefresh = false) {
+  const stale = forceRefresh || Date.now() - sdkCache.fetchedAt >= sdkTtl();
   if (stale && !sdkInflight) {
+    const generation = sdkGeneration;
     sdkInflight = sdkSessionList().then((sessions) => {
+      if (generation !== sdkGeneration) return;
       if (sessions) {
         const seenIds = new Set();
         const now = Date.now();
@@ -1188,6 +1191,57 @@ async function handleApi(request, response) {
       });
     } catch (error) {
       sendJson(response, 500, { code: 'preflight_failed', error: error.message });
+    }
+    return true;
+  }
+
+  const closePrefix = '/api/sessions/';
+  if (url.pathname.startsWith(closePrefix) && url.pathname.endsWith('/close')) {
+    if (request.method !== 'POST') {
+      sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+      return true;
+    }
+    let sessionId;
+    try {
+      const encodedId = url.pathname.slice(closePrefix.length, -'/close'.length);
+      sessionId = decodeURIComponent(encodedId);
+      if (!sessionId.trim() || /[/\\\u0000-\u001f\u007f]/.test(sessionId)) throw new Error('invalid_id');
+    } catch {
+      sendJson(response, 400, { code: 'malformed_session_id', error: '세션 ID 형식이 올바르지 않습니다.' });
+      return true;
+    }
+    try {
+      // 종료 권한 판단에는 목록의 오래된 캐시나 실패 시 유지된 값을 사용하지 않는다.
+      sdkSnapshot(true);
+      await sdkInflight;
+      if (sdkCache.failures) {
+        sendJson(response, 502, { code: 'broker_unavailable', error: '브로커에서 세션 연결 상태를 확인하지 못했습니다.' });
+        return true;
+      }
+      const entries = sdkCache.sessions.filter((entry) => entry.sessionId === sessionId);
+      if (entries.length > 1 || entries.some((entry) => entry.ambiguous === true || entry.terminalUncertain === true)) {
+        sendJson(response, 409, { code: 'session_uncertain', error: '세션 연결이 불확실하거나 중복되어 안전하게 종료할 수 없습니다.' });
+        return true;
+      }
+      if (!isSdkLive(entries[0])) {
+        sendJson(response, 404, { code: 'session_offline', error: '연결된 세션을 찾을 수 없습니다.' });
+        return true;
+      }
+      const { stdout } = await runFile(
+        process.env.GJC_SDK_CLI || 'gjc',
+        ['sdk', 'session', 'raw', 'global', '--op', 'session.close', '--json-input', JSON.stringify({ sessionId }), '--idempotency-key', randomUUID()],
+        // 브로커의 graceful close와 SIGTERM fallback이 끝날 시간을 확보한다.
+        { timeout: 15000, maxBuffer: 8 * 1024 * 1024 },
+      );
+      if (JSON.parse(stdout)?.ok !== true) throw new Error('close_failed');
+      // 종료 전에 시작된 목록 갱신이 성공 결과를 다시 LIVE로 덮어쓰지 못하게 한다.
+      sdkGeneration += 1;
+      sdkCache = { ...sdkCache, fetchedAt: Date.now(), sessions: sdkCache.sessions.filter((entry) => entry.sessionId !== sessionId) };
+      sdkFirstSeenAt.delete(sessionId);
+      rotateRevision();
+      sendJson(response, 200, { closed: true, sessionId });
+    } catch {
+      sendJson(response, 502, { code: 'session_close_failed', error: '브로커가 세션을 종료하지 못했습니다. 연결 상태를 확인한 후 다시 시도해 주세요.' });
     }
     return true;
   }
