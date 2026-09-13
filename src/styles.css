@@ -206,6 +206,8 @@ details.filter-block { display: block; padding-bottom: 0; }
 .session-title:focus-visible::after { outline: 2px solid var(--color-focus); outline-offset: -2px; }
 .session-copy > p { display: -webkit-box; overflow: hidden; margin: var(--space-xs) 0; color: var(--color-body); font-size: var(--text-sm); line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 1; }
 .session-path { display: block; overflow: hidden; color: var(--color-muted); font: var(--text-xs)/1.4 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.session-groups { display: flex; flex-wrap: wrap; gap: var(--space-2xs); min-width: 0; margin-top: var(--space-xs); }
+.session-group-badge { min-width: 0; max-width: 100%; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-xs); color: var(--color-body); background: var(--color-paper-2); font: var(--text-xs)/1.4 var(--font-mono); overflow-wrap: anywhere; }
 .session-id { flex: none; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-rule); border-radius: var(--radius-xs); color: var(--color-muted); background: var(--color-paper); font: var(--text-xs)/1 var(--font-mono); }
 .archive-badge { flex: none; padding: var(--space-2xs) var(--space-xs); border: var(--rule-thin) solid var(--color-rule-strong); border-radius: var(--radius-xs); color: var(--color-muted); background: var(--color-paper-2); font: var(--text-xs)/1 var(--font-mono); font-style: normal; white-space: nowrap; }
 /* 살아있는 세션 표시. success 쌍을 쓴다 — accent는 포커스·주 동작 전용이라 장식에 쓰지 않는다.

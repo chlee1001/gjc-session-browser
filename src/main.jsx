@@ -304,7 +304,7 @@ function ModelSessions({ model, from, to, group, revision, onClose, onSelect }) 
   );
 }
 
-const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onArchive, selectMode, selected, onSelect }) {
+const SessionRow = memo(function SessionRow({ session, groups, onOpen, onSetStatus, onArchive, selectMode, selected, onSelect }) {
   // 세션 헤더의 모델은 마지막으로 고른 하나라 실제로 쓴 모델을 대표하지 못한다. 토큰을 가장 많이 쓴 쪽을 앞에 세운다.
   const model = splitModel(session.models[0]?.id || session.model);
   return (
@@ -324,6 +324,11 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onAr
           </div>
           {session.preview ? <p>{session.preview}</p> : null}
           <span className="session-path">{session.cwd || '작업 폴더 정보 없음'}</span>
+          {groups?.length ? (
+            <div className="session-groups" role="group" aria-label="소속 그룹">
+              {groups.map((group) => <span key={group.id} className="session-group-badge">{group.name}</span>)}
+            </div>
+          ) : null}
         </div>
         {/* 정렬 기준과 같은 세 개만 남긴다. 메시지 수와 파일 크기는 상세에서 본다. */}
         <dl className="session-metrics">
@@ -974,6 +979,16 @@ function App() {
   }, []);
 
   const paletteSessions = useMemo(() => sessions.slice(0, PALETTE_LIMIT), [sessions]);
+  const groupsBySessionId = useMemo(() => {
+    const memberships = new Map();
+    for (const group of summary?.groups || []) {
+      for (const sessionId of group.sessionIds) {
+        if (!memberships.has(sessionId)) memberships.set(sessionId, []);
+        memberships.get(sessionId).push(group);
+      }
+    }
+    return memberships;
+  }, [summary?.groups]);
   // 검색 결과가 줄어 선택이 범위를 벗어나면 하이라이트가 사라진다. 효과가 아니라 렌더에서 보정한다.
   const paletteActiveIndex = Math.min(activeIndex, Math.max(paletteSessions.length - 1, 0));
 
@@ -1699,7 +1714,7 @@ function App() {
                 const session = sessions[virtualRow.index];
                 return (
                   <div key={virtualRow.key} data-index={virtualRow.index} ref={rowVirtualizer.measureElement} className="virtual-row" style={{ transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)` }}>
-                    <SessionRow session={session} onOpen={openDetail} onSetStatus={setSessionStatus} onArchive={archiveSession} selectMode={selectMode} selected={selectedIds.has(session.id)} onSelect={toggleSelected} />
+                    <SessionRow session={session} groups={groupsBySessionId.get(session.id)} onOpen={openDetail} onSetStatus={setSessionStatus} onArchive={archiveSession} selectMode={selectMode} selected={selectedIds.has(session.id)} onSelect={toggleSelected} />
                   </div>
                 );
               })}
