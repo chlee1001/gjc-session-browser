@@ -21,6 +21,8 @@ async function availablePort() {
 async function writeSdkStub(home, payload) {
   const stub = path.join(home, "sdk-stub.mjs");
   await writeFile(stub, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(path.join(home, 'sdk-args.json'))}, JSON.stringify(process.argv.slice(2)));
 process.stdout.write(JSON.stringify(${JSON.stringify(payload)}));
 `);
   await chmod(stub, 0o755);
@@ -35,7 +37,7 @@ async function writeSdkOffStub(home) {
 function sdkEntry({ id, repo, live = true, at = Date.now(), pid = 4242 }) {
   return {
     sessionId: id,
-    locator: { repo, stateRoot: `${repo}/.gjc/state` },
+    locator: { cwd: repo, worktreeRoot: repo, stateRoot: `${repo}/.gjc/state` },
     endpointGeneration: 1,
     pid,
     live,
@@ -116,6 +118,20 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
       { id: 'anthropic/claude-test', sessions: 1, responses: 1, tokens: 120, cost: 0.5 },
       { id: 'openai/gpt-test', sessions: 1, responses: 1, tokens: 80, cost: 0.25 },
     ], '기간 통계의 토큰은 모델별로도 나뉘어 나온다');
+
+    const groupResponse = await fetch(`${baseUrl}/api/groups`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: ' Model group ' }),
+    });
+    assert.equal(groupResponse.status, 201);
+    const { group } = await groupResponse.json();
+    const emptyModelGroup = await (await fetch(`${baseUrl}/api/models/sessions?model=anthropic%2Fclaude-test&group=${group.id}`)).json();
+    assert.deepEqual(emptyModelGroup.contributions, []);
+    const membershipResponse = await fetch(`${baseUrl}/api/groups/${group.id}/sessions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: [sessionId], member: true }),
+    });
+    assert.equal(membershipResponse.status, 200);
+    const groupedModel = await (await fetch(`${baseUrl}/api/models/sessions?model=anthropic%2Fclaude-test&group=${group.id}`)).json();
+    assert.deepEqual(groupedModel.contributions.map((entry) => entry.id), [sessionId]);
 
     const archiveResponse = await fetch(`${baseUrl}/api/archive/${sessionId}`, {
       method: 'PUT',
@@ -370,6 +386,7 @@ test('API에서 세션 제목을 변경하고 확인 후 영구 삭제한다', {
     const config = JSON.parse(await readFile(path.join(home, '.gjc', 'session-list.json'), 'utf8'));
     assert.deepEqual(config.sessionStatus, {}, '삭제된 세션의 상태는 설정에서 사라져야 한다');
     assert.deepEqual(config.archivedSessionIds, [], '삭제된 세션의 보관 오버레이도 설정에서 사라져야 한다');
+    assert.deepEqual(config.sessionGroups, [{ id: group.id, name: 'Model group', sessionIds: [] }]);
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));
@@ -725,6 +742,145 @@ async function startOverlayServer({ home, sessions = [], sdkPayload }) {
   return { server, baseUrl, listing };
 }
 
+test('groups validate, persist, and filter file and live SDK sessions', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-groups-'));
+  const configPath = path.join(home, '.gjc', 'session-list.json');
+  const fileId = 'group-file';
+  const liveId = 'group-live';
+  const deadId = 'group-dead';
+  const savedId = '9d51d5d8-0000-4000-8000-000000000001';
+  const duplicateId = '9d51d5d8-0000-4000-8000-000000000002';
+  const unknownId = '9d51d5d8-0000-4000-8000-000000000003';
+  await mkdir(path.dirname(configPath), { recursive: true });
+  await writeFile(configPath, JSON.stringify({
+    focusedSessionIds: [fileId],
+    sessionGroups: [
+      { id: savedId, name: ' Saved ', sessionIds: [fileId, fileId, 7, null, '', 'missing'] },
+      { id: duplicateId, name: 'saved', sessionIds: [] },
+      { id: savedId, name: 'Repeated ID', sessionIds: [] },
+      { id: 'not-a-uuid', name: 'Bad ID', sessionIds: [] },
+      { id: [unknownId], name: 'Non-string ID', sessionIds: [] },
+      { id: unknownId, name: ' ', sessionIds: [] },
+      { id: unknownId, name: 'x'.repeat(61), sessionIds: [] },
+      { id: unknownId, name: 'Bad members', sessionIds: 'wrong' },
+      null,
+    ],
+  }));
+  const options = {
+    home,
+    sessions: [{ id: fileId, scope: 'scope' }],
+    sdkPayload: { ok: true, result: { sessions: [
+      { ...sdkEntry({ id: liveId, repo: home }), locator: { cwd: home } },
+      sdkEntry({ id: deadId, repo: home, live: false }),
+    ] } },
+  };
+  let running = await startOverlayServer(options);
+  const request = (route, method, body) => fetch(`${running.baseUrl}${route}`, {
+    method, headers: { 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const list = async (query = '') => (await fetch(`${running.baseUrl}/api/sessions${query}`)).json();
+  try {
+    assert.deepEqual((await list()).summary.groups, [{ id: savedId, name: 'Saved', count: 1 }]);
+    const created = await request('/api/groups', 'POST', { name: ' Current ' });
+    assert.equal(created.status, 201);
+    const { group } = await created.json();
+    assert.match(group.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.deepEqual(group, { id: group.id, name: 'Current', sessionIds: [] });
+    for (const name of ['', '  ', 'x'.repeat(61), 123, null]) {
+      assert.equal((await request('/api/groups', 'POST', { name })).status, 400);
+    }
+    assert.equal((await request('/api/groups', 'POST', { name: 'CURRENT' })).status, 409);
+    const racingCreates = await Promise.all([
+      request('/api/groups', 'POST', { name: 'Race' }),
+      request('/api/groups', 'POST', { name: 'race' }),
+    ]);
+    assert.deepEqual(racingCreates.map((response) => response.status).sort(), [201, 409]);
+    const racingGroup = (await racingCreates.find((response) => response.status === 201).json()).group;
+    await request(`/api/groups/${racingGroup.id}`, 'DELETE');
+    assert.equal((await request('/api/groups', 'GET')).status, 405);
+    assert.equal((await request(`/api/groups/${group.id}`, 'PUT', {})).status, 405);
+    assert.equal((await request(`/api/groups/${group.id}/sessions`, 'POST', {})).status, 405);
+    for (const id of ['bad', '%E0%A4%A', '']) {
+      assert.equal((await request(`/api/groups/${id}`, 'DELETE')).status, 400);
+    }
+    assert.equal((await request(`/api/groups/${unknownId}`, 'DELETE')).status, 404);
+    assert.equal((await request(`/api/groups/${unknownId}/sessions`, 'PUT', { ids: [fileId], member: true })).status, 404);
+    assert.equal((await fetch(`${running.baseUrl}/api/sessions?group=bad`)).status, 400);
+    assert.equal((await fetch(`${running.baseUrl}/api/sessions?group=${unknownId}`)).status, 404);
+    const memberRoute = `/api/groups/${group.id}/sessions`;
+    const malformed = await fetch(`${running.baseUrl}${memberRoute}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{',
+    });
+    assert.equal(malformed.status, 400);
+    for (const ids of [[], [123], [''], null, 'wrong']) {
+      assert.equal((await request(memberRoute, 'PUT', { ids, member: true })).status, 400);
+    }
+    assert.equal((await request(memberRoute, 'PUT', { ids: [fileId], member: 'true' })).status, 400);
+    for (const id of ['missing', deadId]) {
+      assert.equal((await request(memberRoute, 'PUT', { ids: [fileId, id], member: true })).status, 404);
+    }
+    assert.equal((await list(`?group=${group.id}`)).resultCount, 0, 'invalid batches do not partially commit');
+    const beforeFailure = (await list()).summary.modelRevision;
+    await chmod(path.dirname(configPath), 0o500);
+    let failedMembership;
+    try {
+      failedMembership = await request(memberRoute, 'PUT', { ids: [fileId], member: true });
+    } finally {
+      await chmod(path.dirname(configPath), 0o700);
+    }
+    assert.equal(failedMembership.status, 500);
+    const afterFailure = await list(`?group=${group.id}`);
+    assert.equal(afterFailure.resultCount, 0);
+    assert.equal(afterFailure.summary.modelRevision, beforeFailure);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).sessionGroups.find((entry) => entry.id === group.id).sessionIds, []);
+    const added = await request(memberRoute, 'PUT', { ids: [fileId, liveId, fileId], member: true });
+    assert.equal(added.status, 200);
+    assert.deepEqual((await added.json()).group.sessionIds, [fileId, liveId]);
+    await request(`/api/archive/${fileId}`, 'PUT', { archived: true });
+    const scoped = await list(`?group=${group.id}`);
+    assert.deepEqual(scoped.sessions.map((session) => session.id), [liveId]);
+    assert.equal(scoped.resultCount, 1);
+    assert.equal(scoped.fileResultCount, 0);
+    assert.equal(scoped.sdkOnlyCount, 1);
+    assert.deepEqual(scoped.summary.archiveCounts, { current: 1, archived: 1, all: 2 });
+    assert.deepEqual(scoped.summary.statusCounts, { none: 1, active: 0, done: 0 });
+    assert.equal(scoped.summary.sessionCount, 1);
+    assert.equal(scoped.summary.archivedSessionCount, 1);
+    const archived = await list(`?group=${group.id}&archive=archived&status=active`);
+    assert.deepEqual(archived.sessions.map((session) => session.id), [fileId]);
+    assert.equal(archived.summary.statusCounts.active, 1);
+    const summaryOnly = await list(`?group=${group.id}&summaryOnly=1&from=2099-01-01`);
+    assert.equal(summaryOnly.resultCount, 0);
+    assert.equal(summaryOnly.summary.sessionCount, 0);
+    assert.deepEqual(summaryOnly.summary.groups, [
+      { id: savedId, name: 'Saved', count: 1 }, { id: group.id, name: 'Current', count: 2 },
+    ], 'group counts ignore group, date, status, and archive filters');
+    assert.equal((await request(memberRoute, 'PUT', { ids: [fileId], member: false })).status, 200);
+    assert.equal((await list(`?group=${group.id}&archive=all`)).summary.sessionCount, 0);
+    const revision = (await list()).summary.modelRevision;
+    await request(memberRoute, 'PUT', { ids: [liveId], member: true });
+    assert.equal((await list()).summary.modelRevision, revision, 'no-op membership does not rotate revision');
+    const persisted = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.deepEqual(persisted.sessionGroups, [
+      { id: savedId, name: 'Saved', sessionIds: [fileId, 'missing'] },
+      { id: group.id, name: 'Current', sessionIds: [liveId] },
+    ]);
+    assert.equal('focusedSessionIds' in persisted, false);
+    running.server.kill('SIGTERM');
+    await new Promise((resolve) => running.server.once('exit', resolve));
+    running = await startOverlayServer(options);
+    assert.deepEqual((await list(`?group=${group.id}`)).sessions.map((session) => session.id), [liveId]);
+    assert.deepEqual(await (await request(`/api/groups/${group.id}`, 'DELETE')).json(), { removed: true });
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).sessionGroups,
+      [{ id: savedId, name: 'Saved', sessionIds: [fileId, 'missing'] }]);
+  } finally {
+    running.server.kill('SIGTERM');
+    await new Promise((resolve) => running.server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없는 세션을 가상 행으로 올린다', { timeout: 45_000 }, async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-overlay-'));
   const liveId = '9d51d5d8-0000-4000-8000-00000000a001';
@@ -759,9 +915,9 @@ test('SDK 라이브 오버레이가 파일 세션에 live를 얹고 파일 없�
     const listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
     const byId = new Map(listing.sessions.map((session) => [session.id, session]));
 
-    // 1) 라이브 + 파일 있음: live가 붙고 lastActivity가 activity.at으로 치환된다.
+    // 1) 라이브 + 파일 있음: 연결 여부만 붙고 실제 대화 시각은 파일 값을 유지한다.
     assert.equal(byId.get(liveId).live, true);
-    assert.equal(byId.get(liveId).lastActivity, new Date(at).toISOString());
+    assert.equal(byId.get(liveId).lastActivity, '2026-08-10T01:00:00.000Z');
     assert.equal(byId.get(liveId).sdkOnly, false);
 
     // 2) 죽음 + 파일 있음: live는 false이고 파일 기준 시각이 유지된다.
@@ -988,7 +1144,8 @@ test('브로커가 망가진 값을 줘도 목록은 200을 유지한다', { tim
     // 어떤 행에도 Invalid Date가 새어나오지 않는다.
     for (const session of listing.sessions) {
       assert.notEqual(session.lastActivity, 'Invalid Date');
-      if (session.lastActivity) assert.ok(!Number.isNaN(Date.parse(session.lastActivity)));
+      assert.ok(session.lastActivity, '실행 중인 행은 안정적인 최초 감지 시각으로 보완한다');
+      assert.ok(!Number.isNaN(Date.parse(session.lastActivity)));
     }
     // 중복 id는 한 줄로 접힌다.
     const dupes = listing.sessions.filter((session) => session.id === '9d51d5d8-0000-4000-8000-00000000e005');
@@ -1018,7 +1175,7 @@ test('브로커가 시각을 ISO 문자열로 줘도 실시간 값으로 인정�
         sessions: [
           // epoch ms 대신 ISO 문자열. 숫자로만 강제하면 이 값이 조용히 버려진다.
           { sessionId: fileId, locator: { repo: home }, live: true, pid: 501, activity: { state: 'active', at: iso }, lastHeartbeatAt: iso },
-          { sessionId: orphanId, locator: { repo: home }, live: true, pid: 502, activity: { state: 'active', at: iso }, lastHeartbeatAt: iso },
+          { sessionId: orphanId, locator: { cwd: home, repo: '/wrong-legacy-repo' }, live: true, pid: 502, activity: { state: 'active', at: iso }, lastHeartbeatAt: iso },
         ],
       },
     },
@@ -1027,10 +1184,56 @@ test('브로커가 시각을 ISO 문자열로 줘도 실시간 값으로 인정�
   try {
     const listing = await (await fetch(`${baseUrl}/api/sessions`)).json();
     const byId = new Map(listing.sessions.map((session) => [session.id, session]));
-    // 파일 세션: 파일 시각으로 되돌아가지 않고 브로커 시각이 얹혀야 한다.
-    assert.equal(byId.get(fileId).lastActivity, iso);
+    // 파일 세션: 하트비트는 실제 대화가 아니므로 세션 파일의 활동 시각을 유지한다.
+    assert.equal(byId.get(fileId).lastActivity, '2026-08-10T01:00:00.000Z');
     // 가상 세션: 현재 시각 폴백이 아니라 준 시각 그대로여야 한다.
     assert.equal(byId.get(orphanId).lastActivity, iso);
+    assert.equal(byId.get(orphanId).cwd, home);
+    assert.equal(byId.get(orphanId).folderName, path.basename(home));
+    assert.deepEqual(JSON.parse(await readFile(path.join(home, 'sdk-args.json'), 'utf8')),
+      ['sdk', 'session', 'list', '--scope', 'all']);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => server.once('exit', resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('브로커의 대기·불확실·삭제 상태를 실행 상태와 구분한다', { timeout: 45_000 }, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'gjc-sdk-state-'));
+  const busyId = '9d51d5d8-0000-4000-8000-00000000f201';
+  const idleId = '9d51d5d8-0000-4000-8000-00000000f202';
+  const uncertainId = '9d51d5d8-0000-4000-8000-00000000f203';
+  const deletedId = '9d51d5d8-0000-4000-8000-00000000f204';
+  const idleAt = '2026-08-16T10:30:00.000Z';
+  const { server, baseUrl } = await startOverlayServer({
+    home,
+    sdkPayload: {
+      ok: true,
+      result: {
+        version: 2,
+        source: 'broker',
+        sessions: [
+          { ...sdkEntry({ id: busyId, repo: home }), activity: { state: 'active', at: '2026-08-16T11:00:00.000Z' } },
+          { ...sdkEntry({ id: idleId, repo: home, at: idleAt }), activity: { state: 'idle', at: idleAt }, ambiguous: true },
+          { ...sdkEntry({ id: uncertainId, repo: home }), terminalUncertain: true },
+          { ...sdkEntry({ id: deletedId, repo: home }), deleted: true },
+        ],
+      },
+    },
+  });
+
+  try {
+    const listing = await (await fetch(`${baseUrl}/api/sessions?live=1`)).json();
+    const byId = new Map(listing.sessions.map((session) => [session.id, session]));
+    assert.deepEqual([...byId.keys()].sort(), [busyId, idleId].sort());
+    assert.equal(listing.summary.liveCount, 2);
+    assert.equal(byId.get(busyId).busy, true);
+    assert.equal(byId.get(idleId).busy, false);
+    assert.equal(byId.get(idleId).ambiguous, true);
+    assert.equal(byId.get(idleId).lastActivity, idleAt);
+    assert.equal(byId.has(uncertainId), false);
+    assert.equal(byId.has(deletedId), false);
   } finally {
     server.kill('SIGTERM');
     await new Promise((resolve) => server.once('exit', resolve));

@@ -30,15 +30,19 @@ const SDK_LIVE_TTL_MS = 5000;
 const SDK_IDLE_TTL_MS = 30000;
 let sdkCache = { fetchedAt: 0, sessions: [], failures: 0 };
 let sdkInflight = null;
+const sdkFirstSeenAt = new Map();
 let sessionStatus = new Map();
 let sessionMap = new Map();
 let sessionCopyPathsById = new Map();
 let archivedSessionIds = new Set();
+let sessionGroups = [];
+const GROUP_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let pendingDeletePairs = new Map();
 let modelRevision = randomUUID();
 let configQueue = Promise.resolve();
 let initialized = false;
 let initializePromise = null;
+let forcedInitializePromise = null;
 let generation = 0;
 let status = { indexing: false, indexedCount: 0, totalCount: 0, scannedAt: 0 };
 let gjcPackageDirectoryPromise;
@@ -78,6 +82,19 @@ async function loadDirectories() {
       ? config.archivedSessionIds.filter((id) => typeof id === 'string' && id.length > 0)
       : [],
   );
+  sessionGroups = [];
+  for (const group of Array.isArray(config.sessionGroups) ? config.sessionGroups : []) {
+    const name = typeof group?.name === 'string' ? group.name.trim() : '';
+    if (typeof group?.id !== 'string' || !GROUP_ID_PATTERN.test(group.id)
+      || !name || name.length > 60 || !Array.isArray(group.sessionIds)) continue;
+    const id = group.id.toLowerCase();
+    if (sessionGroups.some((existing) => existing.id === id || existing.name.toLowerCase() === name.toLowerCase())) continue;
+    sessionGroups.push({
+      id,
+      name,
+      sessionIds: [...new Set(group.sessionIds.filter((sessionId) => typeof sessionId === 'string' && sessionId.length > 0))],
+    });
+  }
 }
 
 function configuredDirectories() {
@@ -98,6 +115,7 @@ function configJson(draft) {
     directories: draft.directories,
     sessionStatus: Object.fromEntries(draft.sessionStatus),
     archivedSessionIds: [...draft.archivedSessionIds].sort(),
+    sessionGroups: draft.sessionGroups,
   }, null, 2);
 }
 
@@ -122,6 +140,7 @@ function committedDraft() {
     directories: [...customDirectories],
     sessionStatus: new Map(sessionStatus),
     archivedSessionIds: new Set(archivedSessionIds),
+    sessionGroups: sessionGroups.map((group) => ({ ...group, sessionIds: [...group.sessionIds] })),
   };
 }
 
@@ -129,6 +148,7 @@ function publishConfig(draft, rotate) {
   customDirectories = draft.directories;
   sessionStatus = draft.sessionStatus;
   archivedSessionIds = draft.archivedSessionIds;
+  sessionGroups = draft.sessionGroups;
   if (rotate) rotateRevision();
 }
 
@@ -190,7 +210,14 @@ async function refreshIndex(cachedSessions) {
 
 async function initializeIndex(force = false) {
   if (initialized && !force) return;
-  if (initializePromise) return initializePromise;
+  if (forcedInitializePromise) return forcedInitializePromise;
+  if (initializePromise) {
+    if (!force) return initializePromise;
+    forcedInitializePromise = initializePromise
+      .then(() => refreshIndex([...sessionMap.values()]))
+      .finally(() => { forcedInitializePromise = null; });
+    return forcedInitializePromise;
+  }
 
   initializePromise = (async () => {
     if (!initialized) await loadDirectories();
@@ -234,11 +261,11 @@ function persistCache() {
 }
 
 /**
- * 브로커가 보고하는 살아있음. `live`만 보면 안 된다 — 죽은 프로세스가 activity를
- * 남긴 잔여 항목이 실측 12건 있었다. 두 조건을 모두 만족해야 살아있는 세션이다.
+ * 브로커의 live 판정에서 삭제·터미널 불확실 행을 제외한다.
+ * activity.state는 생존 여부가 아니라 실행 중(active)/입력 대기(idle) 표시용이다.
  */
 function isSdkLive(entry) {
-  return entry?.live === true && entry?.activity?.state === 'active';
+  return entry?.live === true && entry?.terminalUncertain !== true && entry?.deleted !== true;
 }
 
 /**
@@ -262,7 +289,7 @@ async function sdkSessionList() {
   try {
     const { stdout } = await runFile(
       process.env.GJC_SDK_CLI || 'gjc',
-      ['sdk', 'session', 'list', '--timeout-ms', String(SDK_CALL_TIMEOUT_MS)],
+      ['sdk', 'session', 'list', '--scope', 'all'],
       { timeout: SDK_CALL_TIMEOUT_MS + 1000, maxBuffer: 8 * 1024 * 1024 },
     );
     const payload = JSON.parse(stdout);
@@ -274,7 +301,9 @@ async function sdkSessionList() {
 }
 
 function sdkTtl() {
-  return sdkCache.sessions.some(isSdkLive) ? SDK_LIVE_TTL_MS : SDK_IDLE_TTL_MS;
+  return sdkCache.sessions.some((entry) => isSdkLive(entry) && entry.activity?.state === 'active')
+    ? SDK_LIVE_TTL_MS
+    : SDK_IDLE_TTL_MS;
 }
 
 /**
@@ -286,6 +315,16 @@ function sdkSnapshot() {
   if (stale && !sdkInflight) {
     sdkInflight = sdkSessionList().then((sessions) => {
       if (sessions) {
+        const seenIds = new Set();
+        const now = Date.now();
+        for (const entry of sessions) {
+          if (typeof entry?.sessionId !== 'string' || !entry.sessionId) continue;
+          seenIds.add(entry.sessionId);
+          if (!sdkFirstSeenAt.has(entry.sessionId)) sdkFirstSeenAt.set(entry.sessionId, now);
+        }
+        for (const id of sdkFirstSeenAt.keys()) {
+          if (!seenIds.has(id)) sdkFirstSeenAt.delete(id);
+        }
         sdkCache = { fetchedAt: Date.now(), sessions, failures: 0 };
       } else {
         const failures = sdkCache.failures + 1;
@@ -307,16 +346,17 @@ function sdkSnapshot() {
     .map((entry) => [entry.sessionId, entry]));
 }
 
-/** 파일 세션 위에 브로커 상태를 얹는다. 죽은 항목의 하트비트가 파일 시각을 덮지 않게 게이팅한다. */
+/** 파일 세션에는 연결 여부만 얹는다. 하트비트는 실제 대화 활동이 아니므로 파일 활동 시각을 덮지 않는다. */
 function withSdkOverlay(session, entry) {
   const live = isSdkLive(entry);
-  const activityAt = live ? sdkInstant(entry.activity?.at) : '';
   return {
     ...session,
     live,
+    busy: live && entry.activity?.state === 'active',
+    ambiguous: live && entry.ambiguous === true,
     pid: live ? entry.pid : 0,
     sdkOnly: false,
-    lastActivity: activityAt || session.lastActivity,
+    lastActivity: session.lastActivity,
   };
 }
 
@@ -325,10 +365,14 @@ function withSdkOverlay(session, entry) {
  * filterSessions·집계·정렬·페이지 나누기를 고치지 않고 그대로 통과한다.
  */
 function sdkOnlySession(entry) {
-  const cwd = entry.locator?.repo || '';
+  const cwd = typeof entry.locator?.cwd === 'string' ? entry.locator.cwd
+    : typeof entry.locator?.repo === 'string' ? entry.locator.repo : '';
   const folderName = cwd ? path.basename(cwd) : '알 수 없음';
-  // 시각을 못 믿을 땐 현재 시각으로 떨어뜨린다. 살아있다고 보고된 세션이니 지금이 가장 가까운 근사다.
-  const lastActivity = sdkInstant(entry.activity?.at) || sdkInstant(entry.lastHeartbeatAt) || new Date().toISOString();
+  // 정렬 키는 요청마다 바뀌면 안 된다. 브로커 시각이 없으면 안정적인 endpoint mtime까지 사용한다.
+  const lastActivity = sdkInstant(entry.activity?.at)
+    || sdkInstant(entry.lastHeartbeatAt)
+    || sdkInstant(entry.endpointMtimeMs)
+    || sdkInstant(sdkFirstSeenAt.get(entry.sessionId));
   return {
     id: entry.sessionId,
     title: `${folderName} · 기록 준비 중`,
@@ -349,6 +393,8 @@ function sdkOnlySession(entry) {
     preview: '',
     indexed: false,
     live: true,
+    busy: entry.activity?.state === 'active',
+    ambiguous: entry.ambiguous === true,
     pid: entry.pid || 0,
     sdkOnly: true,
     // filterSessions와 같은 소문자 정규화를 써야 검색이 파일 세션과 동일하게 동작한다.
@@ -788,6 +834,9 @@ async function deleteLogicalSession(session) {
   const draft = committedDraft();
   draft.sessionStatus.delete(session.id);
   draft.archivedSessionIds.delete(session.id);
+  for (const group of draft.sessionGroups) {
+    group.sessionIds = group.sessionIds.filter((id) => id !== session.id);
+  }
   await writeConfig(draft).then(() => {
     publishConfig(draft, true);
   }).catch((error) => {
@@ -829,8 +878,113 @@ function deleteSessionSerialized(sessionId) {
   return work;
 }
 
+function groupError(statusCode, code) {
+  const messages = {
+    malformed_group_id: '그룹 식별자가 올바르지 않습니다.',
+    group_not_found: '그룹을 찾을 수 없습니다.',
+    invalid_body: '요청 내용을 읽을 수 없습니다.',
+    invalid_name: '그룹 이름은 1자 이상 60자 이하로 입력하세요.',
+    duplicate_group_name: '같은 이름의 그룹이 이미 있습니다.',
+    invalid_ids: '그룹에 변경할 세션을 하나 이상 선택하세요.',
+    invalid_member: '그룹 추가 또는 제외 여부가 올바르지 않습니다.',
+    deletion_in_progress: '삭제 중인 세션은 그룹을 변경할 수 없습니다.',
+    session_not_found: '선택한 세션을 찾을 수 없습니다.',
+  };
+  return Object.assign(new Error(messages[code] || '그룹을 변경하지 못했습니다.'), { statusCode, code });
+}
+
+function requireGroup(groups, id) {
+  if (typeof id !== 'string' || !GROUP_ID_PATTERN.test(id)) throw groupError(400, 'malformed_group_id');
+  const group = groups.find((entry) => entry.id === id.toLowerCase());
+  if (!group) throw groupError(404, 'group_not_found');
+  return group;
+}
+
+function filterByGroup(sessions, searchParams) {
+  if (!searchParams.has('group')) return sessions;
+  const ids = new Set(requireGroup(sessionGroups, searchParams.get('group')).sessionIds);
+  return sessions.filter((session) => ids.has(session.id));
+}
+
 async function handleApi(request, response) {
   const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+
+  if (url.pathname === '/api/groups' || url.pathname.startsWith('/api/groups/')) {
+    try {
+      const collection = url.pathname === '/api/groups';
+      const parts = url.pathname.slice('/api/groups/'.length).split('/');
+      const membership = !collection && parts.length === 2 && parts[1] === 'sessions';
+      if (!collection && !membership && parts.length !== 1) throw groupError(400, 'malformed_group_id');
+      if (request.method !== (collection ? 'POST' : membership ? 'PUT' : 'DELETE')) {
+        sendJson(response, 405, { error: '지원하지 않는 요청 방식입니다.' });
+        return true;
+      }
+      await initializeIndex();
+      let id;
+      if (!collection) {
+        try { id = decodeURIComponent(parts[0]); } catch { throw groupError(400, 'malformed_group_id'); }
+        requireGroup(sessionGroups, id);
+      }
+      let body;
+      if (collection || membership) {
+        try { body = await readBody(request); } catch (error) {
+          if (error.code === 'body_too_large') throw error;
+          throw groupError(400, 'invalid_body');
+        }
+      }
+      let group;
+      if (collection) {
+        const name = typeof body?.name === 'string' ? body.name.trim() : '';
+        if (!name || name.length > 60) throw groupError(400, 'invalid_name');
+        await mutateConfig((draft) => {
+          if (draft.sessionGroups.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) {
+            throw groupError(409, 'duplicate_group_name');
+          }
+          group = { id: randomUUID(), name, sessionIds: [] };
+          draft.sessionGroups.push(group);
+          return { changed: true };
+        });
+        sendJson(response, 201, { group });
+      } else if (membership) {
+        if (!Array.isArray(body?.ids) || !body.ids.length
+          || body.ids.some((sessionId) => typeof sessionId !== 'string' || !sessionId.length)) {
+          throw groupError(400, 'invalid_ids');
+        }
+        if (typeof body.member !== 'boolean') throw groupError(400, 'invalid_member');
+        const ids = [...new Set(body.ids)];
+        await mutateConfig((draft) => {
+          group = requireGroup(draft.sessionGroups, id);
+          const sdk = sdkSnapshot();
+          for (const sessionId of ids) {
+            if (pendingDeletePairs.has(sessionId)) throw groupError(409, 'deletion_in_progress');
+            if (!findSessionById(sessionId) && !isSdkLive(sdk.get(sessionId))) throw groupError(404, 'session_not_found');
+          }
+          const members = new Set(group.sessionIds);
+          let changed = false;
+          for (const sessionId of ids) {
+            if (members.has(sessionId) === body.member) continue;
+            changed = true;
+            if (body.member) members.add(sessionId);
+            else members.delete(sessionId);
+          }
+          group.sessionIds = [...members];
+          return { changed };
+        });
+        sendJson(response, 200, { group });
+      } else {
+        await mutateConfig((draft) => {
+          group = requireGroup(draft.sessionGroups, id);
+          draft.sessionGroups = draft.sessionGroups.filter((entry) => entry.id !== group.id);
+          return { changed: true };
+        });
+        sendJson(response, 200, { removed: true });
+      }
+    } catch (error) {
+      sendJson(response, error.code === 'body_too_large' ? 413 : error.statusCode || 500,
+        { code: error.code || 'group_write_failed', error: error.message });
+    }
+    return true;
+  }
 
   if (url.pathname === '/api/directories' && request.method === 'POST') {
     try {
@@ -1161,7 +1315,14 @@ async function handleApi(request, response) {
       return true;
     }
     const model = url.searchParams.get('model');
-    const sessions = filterSessions(sessionsSorted(), {
+    let groupedSessions;
+    try {
+      groupedSessions = filterByGroup(sessionsSorted(), url.searchParams);
+    } catch (error) {
+      sendJson(response, error.statusCode || 500, { code: error.code, error: error.message });
+      return true;
+    }
+    const sessions = filterSessions(groupedSessions, {
       from: url.searchParams.get('from') || '',
       to: url.searchParams.get('to') || '',
     });
@@ -1220,7 +1381,7 @@ async function handleApi(request, response) {
     }
     const liveOnly = url.searchParams.get('live') === '1';
 
-    const scoped = filterSessions(allSessions, { from, to });
+    const scoped = filterSessions(filterByGroup(allSessions, url.searchParams), { from, to });
     const searched = filterSessions(scoped, { query, folder });
     const statusSearched = statuses.length
       ? searched.filter((session) => statuses.includes(sessionStatus.get(session.id) || 'none'))
@@ -1251,7 +1412,13 @@ async function handleApi(request, response) {
     const page = summaryOnly ? [] : filtered.slice(offset, offset + limit);
     // 토큰·비용·메시지 총계는 파일 진실만 센다. 가상 세션은 그 숫자를 모른다.
     const summary = getSummary(scoped.filter((session) => !session.sdkOnly));
-    // 폴더 옵션에는 SDK-only 세션의 repo도 들어가야 그 폴더로 걸러볼 수 있다.
+    const knownIds = new Set(allSessions.map((session) => session.id));
+    summary.groups = sessionGroups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      count: group.sessionIds.filter((id) => knownIds.has(id)).length,
+    }));
+    // 폴더 옵션에는 SDK-only 세션의 cwd도 들어가야 그 폴더로 걸러볼 수 있다.
     // 덧붙이기가 아니라 개수 누적이어야 파일과 SDK가 섞인 폴더의 숫자가 맞는다.
     const folderIndex = new Map(summary.folders.map((item) => [item.cwd, { ...item }]));
     for (const session of scoped) {
@@ -1267,7 +1434,15 @@ async function handleApi(request, response) {
     // 사용자 조작에 대한 기대 개수와 무관하다.
     const fileResultCount = filtered.filter((session) => !session.sdkOnly).length;
     sendJson(response, 200, {
-      summary: { ...summary, statusCounts: counts, archiveCounts, liveCount },
+      summary: {
+        ...summary,
+        statusCounts: counts,
+        archiveCounts,
+        liveCount,
+        liveSessionIds: scopedByFilters.filter((session) => session.live).map((session) => session.id),
+        liveCheckedAt: sdkCache.fetchedAt ? new Date(sdkCache.fetchedAt).toISOString() : '',
+        liveCheckHealthy: sdkCache.failures < 2,
+      },
       resultCount: filtered.length,
       fileResultCount,
       sdkOnlyCount: filtered.length - fileResultCount,
@@ -1277,7 +1452,7 @@ async function handleApi(request, response) {
       sessions: page.map(publicSessionWithState),
     });
   } catch (error) {
-    sendJson(response, 500, { error: error.message });
+    sendJson(response, error.statusCode || 500, { ...(error.code ? { code: error.code } : {}), error: error.message });
   }
   return true;
 }

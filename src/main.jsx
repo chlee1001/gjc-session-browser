@@ -21,7 +21,9 @@ const percent = new Intl.NumberFormat('ko-KR', { style: 'percent', maximumFracti
 const relativeTime = new Intl.RelativeTimeFormat('ko', { numeric: 'auto' });
 
 function formatRelative(iso) {
-  const seconds = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  const timestamp = new Date(iso).getTime();
+  if (!Number.isFinite(timestamp)) return '정보 없음';
+  const seconds = Math.round((timestamp - Date.now()) / 1000);
   const ranges = [[60, 'second'], [60, 'minute'], [24, 'hour'], [7, 'day'], [4.345, 'week'], [12, 'month'], [Infinity, 'year']];
   let value = seconds;
   for (const [divisor, unit] of ranges) {
@@ -178,7 +180,7 @@ function ModelUsage({ models, totalTokens, scopeLabel, onOpenSessions }) {
 }
 
 /** 이 모델을 쓴 세션 목록. 세션 상세와 같은 모달 보이스를 쓰고, 행을 누르면 그 세션 상세로 넘어간다. */
-function ModelSessions({ model, from, to, revision, onClose, onSelect }) {
+function ModelSessions({ model, from, to, group, revision, onClose, onSelect }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -198,6 +200,7 @@ function ModelSessions({ model, from, to, revision, onClose, onSelect }) {
     setLoading(true);
     setLoadError('');
     const params = new URLSearchParams({ model: model.id, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    if (group) params.set('group', group);
     if (requestRevision) params.set('revision', requestRevision);
     try {
       const response = await fetch(`/api/models/sessions?${params}`, { signal: controller.signal });
@@ -221,7 +224,7 @@ function ModelSessions({ model, from, to, revision, onClose, onSelect }) {
       setLoadError(error.message);
       setLoading(false);
     }
-  }, [model.id, from, to]);
+  }, [model.id, from, to, group]);
 
   useEffect(() => {
     setRows([]);
@@ -307,7 +310,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onAr
   return (
     <article className={`session-row is-${session.status}${selectMode ? ' is-selecting' : ''}`} id={`session-${session.id}`}>
       {selectMode ? (
-        <label className="session-select"><input type="checkbox" checked={selected} onChange={() => onSelect(session.id)} aria-label={`${session.title} 선택`} /></label>
+        <label className="session-select"><input name={`session-${session.id}`} type="checkbox" checked={selected} onChange={() => onSelect(session.id)} aria-label={`${session.title} 선택`} /></label>
       ) : null}
       <div className="session-body">
         <div className="session-copy">
@@ -315,7 +318,8 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onAr
             {/* 행 전체를 버튼으로 감싸면 제목이 헤딩으로 읽힐 수 없다. 제목만 버튼으로 두고 CSS로 클릭 영역만 늘린다. */}
             <h2><button className="session-title" type="button" aria-haspopup="dialog" onClick={() => onOpen(session)}>{session.title}</button></h2>
             <span className="session-id">{session.id.slice(0, 8)}</span>
-            {session.live ? <span className="live-badge">LIVE</span> : null}
+            {session.live ? <span className="live-badge">연결됨</span> : null}
+            {session.ambiguous ? <span className="uncertain-badge" title="같은 세션 ID가 여러 실행 위치에서 감지됨">위치 중복</span> : null}
             {session.archived ? <span className="archive-badge">보관됨</span> : null}
           </div>
           {session.preview ? <p>{session.preview}</p> : null}
@@ -323,7 +327,7 @@ const SessionRow = memo(function SessionRow({ session, onOpen, onSetStatus, onAr
         </div>
         {/* 정렬 기준과 같은 세 개만 남긴다. 메시지 수와 파일 크기는 상세에서 본다. */}
         <dl className="session-metrics">
-          <div><dt>최근 활동</dt><dd>{formatRelative(session.lastActivity)}</dd></div>
+          <div><dt>{session.sdkOnly ? '연결 확인' : '최근 대화'}</dt><dd>{formatRelative(session.lastActivity)}</dd></div>
           <div><dt>토큰</dt><dd>{session.totalTokens ? number.format(session.totalTokens) : '—'}</dd></div>
           <div><dt>비용</dt><dd>{session.cost ? money.format(session.cost) : '—'}</dd></div>
         </dl>
@@ -384,7 +388,7 @@ function CommandPalette({ open, query, setQuery, sessions, activeIndex, setActiv
         <h2 id="command-title" className="sr-only">세션 빠른 검색</h2>
         <div className="command-input">
           <span aria-hidden="true">⌕</span>
-          <input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목, 대화, 경로, 모델 검색" aria-controls="command-results" />
+          <input name="session-search" ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="제목, 대화, 경로, 모델 검색" aria-controls="command-results" />
           <kbd>ESC</kbd>
         </div>
         <div className="command-results" id="command-results" ref={resultsRef}>
@@ -560,7 +564,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
             </div>
             <p id="detail-archive-help" className="archive-helper">목록에서만 숨김 · 통계 유지</p>
             <form className="rename-form" onSubmit={rename}>
-              <label><span>세션 제목</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
+              <label><span>세션 제목</span><input name="session-title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={120} disabled={saving || deleting || mutationDisabled || session.sdkOnly} aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} /></label>
               <button type="submit" aria-describedby={session.sdkOnly ? 'sdk-only-help' : undefined} disabled={saving || deleting || mutationDisabled || session.sdkOnly || !title.trim() || title.trim() === session.title}>{saving ? '저장 중' : '제목 저장'}</button>
               {/* 비활성 사유를 스크린리더가 읽을 수 있어야 한다. 시각적으로도 남긴다. */}
               {session.sdkOnly ? <p id="sdk-only-help" className="archive-helper">기록 파일이 아직 없어 제목 변경과 삭제를 쓸 수 없습니다.</p> : null}
@@ -612,7 +616,7 @@ function SessionDetail({ selected, detail, loading, error, mutationDisabled, onC
                   <p>삭제 후 복구할 수 없습니다. 아래 범위를 영구 삭제합니다.</p>
                   {preflightLoading ? <p role="status">삭제 범위를 확인하는 중</p> : null}
                   {preflight ? <div className="preflight-paths"><strong>세션 파일 {number.format(preflight.sourceCount ?? preflight.pairs?.length ?? 0)}개 · 아티팩트 폴더 {number.format(preflight.artifactCount ?? preflight.pairs?.length ?? 0)}개</strong><ul>{(preflight.pairs || []).map((pair) => <li key={`${pair.sourcePath}:${pair.artifactPath}`}><code>{pair.sourcePath}</code><code>{pair.artifactPath}</code>{pair.reason ? <span>{pair.reason}</span> : null}</li>)}</ul></div> : null}
-                  <label>확인 문구 <input value={deleteWord} onChange={(event) => setDeleteWord(event.target.value)} aria-describedby="delete-word-help" disabled={deleting} /></label>
+                  <label>확인 문구 <input name="delete-confirmation" value={deleteWord} onChange={(event) => setDeleteWord(event.target.value)} aria-describedby="delete-word-help" disabled={deleting} /></label>
                   <small id="delete-word-help">영구삭제를 정확히 입력하세요.</small>
                   <button type="button" onClick={() => { setConfirmingDelete(false); setPreflight(null); requestAnimationFrame(() => deleteRevealRef.current?.focus()); }} disabled={deleting}>취소</button>
                   <button className="confirm-delete" type="button" onClick={remove} disabled={deleting || !preflight?.authorized || preflight.sessionId !== session.id || deleteWord !== '영구삭제'}>{deleting ? '삭제 중' : '영구 삭제'}</button>
@@ -659,6 +663,7 @@ function App() {
   const [archiveCounts, setArchiveCounts] = useState({ current: 0, archived: 0 });
   const [archiveView, setArchiveView] = useState('current');
   const [liveOnly, setLiveOnly] = useState(false);
+  const [group, setGroup] = useState('');
   const [sort, setSort] = useState('recent');
   const [period, setPeriod] = useState(DEFAULT_PERIOD);
   const [customFrom, setCustomFrom] = useState('');
@@ -672,6 +677,10 @@ function App() {
   // 선택은 모드다. 평소에 행마다 체크박스를 깔아두면 목록이 아니라 컨트롤 격자가 된다.
   const [selectMode, setSelectMode] = useState(false);
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [groupName, setGroupName] = useState('');
+  const [groupTarget, setGroupTarget] = useState('');
+  const [groupSubmitting, setGroupSubmitting] = useState(false);
+  const [groupError, setGroupError] = useState('');
   const [announcement, setAnnouncement] = useState('');
   const [undo, setUndo] = useState(null);
   const [undoSubmitting, setUndoSubmitting] = useState(false);
@@ -718,18 +727,21 @@ function App() {
   }, [resultCount]);
 
   useEffect(() => {
-    const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${sort}:${period}:${customFrom}:${customTo}:${liveOnly}`;
+    const key = `${deferredQuery}:${folder}:${statusFilters.join(',')}:${archiveView}:${group}:${sort}:${period}:${customFrom}:${customTo}:${liveOnly}`;
     if (filterResetRef.current && filterResetRef.current !== key) {
       setPanelResetKey((value) => value + 1);
       // 걸러보는 범위가 바뀌면 되돌릴 대상이 화면 밖으로 나간다. 그때만 되돌리기를 닫는다.
       setUndo(null);
     }
     filterResetRef.current = key;
-  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters, liveOnly]);
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, group, period, sort, statusFilters, liveOnly]);
 
-  const fetchPage = useCallback(async (offset, { append = false, force = false, signal, generation } = {}) => {
+  const fetchPage = useCallback(async (offset, { append = false, merge = false, force = false, signal, generation } = {}) => {
     const { from, to } = periodRange(period, customFrom, customTo);
-    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: String(offset), limit: String(PAGE_SIZE) });
+    // 폴링 병합은 이미 불러온 앞부분을 서버 정렬 그대로 다시 받아야 신규·종료 행을 정확히 반영한다.
+    const requestLimit = merge ? Math.min(Math.max(sessionsRef.current.length, PAGE_SIZE), 100) : PAGE_SIZE;
+    const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: String(offset), limit: String(requestLimit) });
+    if (group) params.set('group', group);
     if (force) params.set('refresh', '1');
     if (liveOnly) params.set('live', '1');
     const response = await fetch(`/api/sessions?${params}`, { signal });
@@ -743,15 +755,27 @@ function App() {
     setResultCount(result.resultCount);
     resultCountRef.current = result.resultCount;
     fileResultCountRef.current = result.fileResultCount ?? result.resultCount;
-    const existing = append ? new Set(sessionsRef.current.map((session) => session.id)) : new Set();
-    const pageRows = append ? result.sessions.filter((session) => !existing.has(session.id)) : result.sessions;
-    setHasMore((append ? sessionsRef.current.length + pageRows.length : pageRows.length) < result.resultCount);
+    const pageIds = new Set(result.sessions.map((session) => session.id));
+    const existingIds = new Set(sessionsRef.current.map((session) => session.id));
+    const liveIds = new Set(result.summary.liveSessionIds || []);
+    const mergeTail = merge
+      ? sessionsRef.current.slice(requestLimit).filter((session) => !pageIds.has(session.id)
+        && (!liveOnly || liveIds.has(session.id)))
+      : [];
+    const loadedCount = merge ? result.sessions.length + mergeTail.length
+      : append ? sessionsRef.current.length + result.sessions.filter((session) => !existingIds.has(session.id)).length
+        : result.sessions.length;
+    setHasMore(loadedCount < result.resultCount);
     setSessions((current) => {
+      if (merge) {
+        // 100행 이후는 다음 무한 스크롤 요청에서 갱신한다. 앞부분은 서버의 필터·정렬 결과가 권위다.
+        return [...result.sessions, ...mergeTail];
+      }
       if (!append) return result.sessions;
       const currentIds = new Set(current.map((session) => session.id));
       return [...current, ...result.sessions.filter((session) => !currentIds.has(session.id))];
     });
-  }, [deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo, liveOnly]);
+  }, [deferredQuery, folder, group, statusFilters, archiveView, sort, period, customFrom, customTo, liveOnly]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -776,22 +800,20 @@ function App() {
   // LIVE 배지와 최근 활동이 멈춘 값으로 남지 않게 하는 것이 목적이다.
   useEffect(() => {
     if (summary?.indexing) return undefined;
-    // 살아있는 세션이 없을 때도 느리게(30초) 돈다. 6초 폴링을 live>0 조건으로만 걸면
+    // 살아있는 세션이 없을 때도 느리게(15초) 돈다. 활성 세션이 있을 때는 5초마다 확인한다.
     // 브로커가 죽거나 세션이 다 끝난 뒤 liveCount가 0이 되는 순간 타이머가 멈추고,
     // 그 값을 되살릴 유일한 수단이 그 타이머라서 새 세션이 떠도 영영 안 보인다.
-    // spawn 상한은 클라이언트 간격이 아니라 서버 TTL이 정한다. 유휴 30초로 늦추면
-    // 로컬 HTTP 요청이 1/5로 줄고, CLI spawn은 서버 TTL 때문에 약 60초에 1회로 묶인다.
-    // 탭을 여러 개 열면 요청은 탭 수만큼 늘어난다(계획의 다중 탭 리스크 참조).
-    const interval = summary?.liveCount > 0 ? 6000 : 30000;
+    // spawn 상한은 클라이언트 간격이 아니라 서버 TTL이 정하므로 폴링을 빠르게 해도
+    // 브로커 프로세스를 중복 실행하지 않는다.
+    const interval = summary?.liveCount > 0 ? 5000 : 15000;
     // 선택 모드에서는 목록을 갈아끼우지 않는다. 첫 페이지 구성원이 바뀌면 화면에 없는 세션이
     // 선택된 채로 남아 일괄 보관이 엉뚱한 대상을 건드린다. 되돌리기가 떠 있을 때도 같다.
     if (selectMode || undo) return undefined;
     let timer = null;
     const tick = () => {
-      // 두 페이지 이상 불러온 뒤에는 건너뛴다. fetchPage(0)은 목록을 첫 페이지로 통째
-      // 교체하므로 가상 스크롤러 높이가 무너지고 무한스크롤이 연쇄로 터진다.
-      if (sessionsRef.current.length > PAGE_SIZE) return;
-      void fetchPage(0, { generation: listGenerationRef.current }).catch(() => {});
+      // 두 페이지 이상 불러온 상태에서는 이미 보이는 행만 병합해 목록 높이와 스크롤을 보존한다.
+      const merge = sessionsRef.current.length > PAGE_SIZE;
+      void fetchPage(0, { merge, generation: listGenerationRef.current }).catch(() => {});
     };
     const start = () => { if (!timer) timer = setInterval(tick, interval); };
     const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
@@ -809,6 +831,7 @@ function App() {
     const timer = setTimeout(async () => {
       const { from, to } = periodRange(period, customFrom, customTo);
       const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, summaryOnly: '1' });
+      if (group) params.set('group', group);
       if (liveOnly) params.set('live', '1');
       try {
         const result = await (await fetch(`/api/sessions?${params}`)).json();
@@ -828,7 +851,7 @@ function App() {
       }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [summary, deferredQuery, folder, statusFilters, archiveView, sort, period, customFrom, customTo]);
+  }, [summary, deferredQuery, folder, group, statusFilters, archiveView, sort, period, customFrom, customTo, liveOnly]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMoreRef.current) return;
@@ -992,6 +1015,7 @@ function App() {
     const generation = ++listGenerationRef.current;
     const { from, to } = periodRange(period, customFrom, customTo);
     const params = new URLSearchParams({ q: deferredQuery, folder, status: statusFilters.join(','), archive: archiveView, sort, from, to, offset: '0', limit: String(PAGE_SIZE), summaryOnly: '1' });
+    if (group) params.set('group', group);
     if (liveOnly) params.set('live', '1');
     try {
       const response = await fetch(`/api/sessions?${params}`);
@@ -1019,7 +1043,7 @@ function App() {
       setPanelResetKey((key) => key + 1);
       setRequestKey((key) => key + 1);
     }
-  }, [archiveView, customFrom, customTo, deferredQuery, folder, period, sort, statusFilters, liveOnly]);
+  }, [archiveView, customFrom, customTo, deferredQuery, folder, group, period, sort, statusFilters, liveOnly]);
 
   const dropSession = useCallback((sessionId, close = true) => {
     const rows = sessionsRef.current.filter((session) => session.id !== sessionId);
@@ -1108,10 +1132,14 @@ function App() {
     }
     // 가상 행은 파일 축 카운트에 들어있지 않다. 빠져도 그 축을 줄이면 안 된다.
     const dropsFileRow = !session.sdkOnly;
+    const scrollTop = window.scrollY;
     if (archiveView === 'current' && archived) {
       dropSession(session.id, origin === 'detail');
       setUndo({ sessions: [session], expiresAt: Date.now() + 30000 });
-      requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
+      requestAnimationFrame(() => {
+        window.scrollTo(0, scrollTop);
+        (undoRef.current || resultsHeadingRef.current)?.focus({ preventScroll: true });
+      });
       resultCountRef.current -= 1;
       if (dropsFileRow) fileResultCountRef.current -= 1;
       void reconcile(fileResultCountRef.current);
@@ -1169,11 +1197,100 @@ function App() {
     });
   }, []);
 
+  const createGroup = async (event) => {
+    event.preventDefault();
+    const name = groupName.trim();
+    if (!name) return;
+    setGroupSubmitting(true);
+    setGroupError('');
+    try {
+      const response = await fetch('/api/groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '그룹을 만들지 못했습니다.');
+      setSummary((current) => current ? {
+        ...current,
+        groups: [...(current.groups || []), { ...result.group, count: result.group.sessionIds?.length || 0 }],
+      } : current);
+      setGroupName('');
+      setGroupTarget(result.group.id);
+      setAnnouncement(`${result.group.name} 그룹을 만들었습니다`);
+    } catch (createError) {
+      setGroupError(createError.message);
+    } finally {
+      setGroupSubmitting(false);
+    }
+  };
+
+  const deleteGroup = async (item) => {
+    if (!window.confirm(`"${item.name}" 그룹을 삭제할까요? 세션 자체는 삭제되지 않습니다.`)) return;
+    setGroupSubmitting(true);
+    setGroupError('');
+    try {
+      const response = await fetch(`/api/groups/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '그룹을 삭제하지 못했습니다.');
+      if (group === item.id) setGroup('');
+      if (groupTarget === item.id) setGroupTarget('');
+      setSummary((current) => current ? {
+        ...current,
+        groups: (current.groups || []).filter((candidate) => candidate.id !== item.id),
+      } : current);
+      setAnnouncement(`${item.name} 그룹을 삭제했습니다`);
+    } catch (removeError) {
+      setGroupError(removeError.message);
+    } finally {
+      setGroupSubmitting(false);
+    }
+  };
+
+  const updateGroupMembership = async (member) => {
+    const ids = [...selectedIds];
+    if (!ids.length || !groupTarget) return;
+    setBulkSubmitting(true);
+    setGroupError('');
+    setError('');
+    const scrollTop = window.scrollY;
+    try {
+      const response = await fetch(`/api/groups/${encodeURIComponent(groupTarget)}/sessions`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, member }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '그룹 구성을 변경하지 못했습니다.');
+      if (!member && group === groupTarget) {
+        const removed = new Set(ids);
+        const removedRows = sessionsRef.current.filter((session) => removed.has(session.id));
+        const rows = sessionsRef.current.filter((session) => !removed.has(session.id));
+        sessionsRef.current = rows;
+        setSessions(rows);
+        setResultCount((count) => Math.max(0, count - removedRows.length));
+        fileResultCountRef.current -= removedRows.filter((session) => !session.sdkOnly).length;
+        void reconcile(fileResultCountRef.current);
+      } else {
+        void reconcile(fileResultCountRef.current);
+      }
+      setSelectedIds(new Set());
+      setSelectMode(false);
+      setAnnouncement(`${number.format(ids.length)}개 세션을 ${member ? '그룹에 추가했습니다' : '그룹에서 제외했습니다'}`);
+      requestAnimationFrame(() => window.scrollTo(0, scrollTop));
+    } catch (membershipError) {
+      setError(membershipError.message);
+    } finally {
+      setBulkSubmitting(false);
+    }
+  };
+
   const archiveSelected = async () => {
     const ids = [...selectedIds];
     if (!ids.length) return;
     const picked = sessionsRef.current.filter((session) => selectedIds.has(session.id));
     setBulkSubmitting(true);
+    const scrollTop = window.scrollY;
     try {
       const response = await fetch('/api/archive', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, archived: true }) });
       const result = await response.json();
@@ -1184,10 +1301,25 @@ function App() {
       setAnnouncement(`보관 완료: 변경 ${outcomes.changed || 0}개, 유지 ${outcomes.noop || 0}개, 찾지 못함 ${outcomes.not_found || 0}개`);
       setSelectedIds(new Set());
       setSelectMode(false);
-      setPanelResetKey((key) => key + 1);
-      setRequestKey((key) => key + 1);
+      if (archiveView === 'current') {
+        const rows = sessionsRef.current.filter((session) => !changedIds.has(session.id));
+        sessionsRef.current = rows;
+        setSessions(rows);
+        setResultCount((count) => Math.max(0, count - changedRows.length));
+        const changedFileRows = changedRows.filter((session) => !session.sdkOnly).length;
+        fileResultCountRef.current -= changedFileRows;
+        void reconcile(fileResultCountRef.current);
+      } else {
+        const rows = sessionsRef.current.map((session) => changedIds.has(session.id) ? { ...session, archived: true } : session);
+        sessionsRef.current = rows;
+        setSessions(rows);
+        void reconcile(fileResultCountRef.current);
+      }
       if (changedRows.length) setUndo({ sessions: changedRows, expiresAt: Date.now() + 30000 });
-      requestAnimationFrame(() => (undoRef.current || resultsHeadingRef.current)?.focus());
+      requestAnimationFrame(() => {
+        window.scrollTo(0, scrollTop);
+        (undoRef.current || resultsHeadingRef.current)?.focus({ preventScroll: true });
+      });
     } catch (batchError) {
       setError(batchError.message);
     } finally {
@@ -1216,23 +1348,27 @@ function App() {
 
   const progress = summary?.totalCount ? Math.round((summary.indexedCount / summary.totalCount) * 100) : 100;
   const sessionDirectories = summary?.sessionDirectories || [];
+  const groups = summary?.groups || [];
   const dialogOpen = paletteOpen || Boolean(selected) || Boolean(activeModel);
   const modelRange = periodRange(period, customFrom, customTo);
   const periodLabel = period === 'custom'
     ? `${customFrom || '처음'} ~ ${customTo || '지금'}`
     : PERIODS.find((item) => item.value === period).label;
-  const scopeLabel = statusFilters.length
+  const statusScopeLabel = statusFilters.length
     ? `${periodLabel} · ${statusFilters.map((value) => STATUS_FACETS.find((item) => item.value === value).label).join(', ')}`
     : periodLabel;
+  const selectedGroup = groups.find((item) => item.id === group);
+  const scopeLabel = selectedGroup ? `${statusScopeLabel} · ${selectedGroup.name}` : statusScopeLabel;
   // "지금 뭐가 걸려 있나"를 설명하던 문장들을 버리고 초기화 버튼 하나로 줄인다.
   const filtersActive = Boolean(query) || statusFilters.length > 0 || archiveView !== 'current'
-    || Boolean(folder) || period !== DEFAULT_PERIOD || liveOnly;
+    || Boolean(folder) || Boolean(group) || period !== DEFAULT_PERIOD || liveOnly;
   const resetFilters = () => {
     setQuery('');
     setStatusFilters([]);
     setArchiveView('current');
     setLiveOnly(false);
     setFolder('');
+    setGroup('');
     setPeriod(DEFAULT_PERIOD);
     setCustomFrom('');
     setCustomTo('');
@@ -1249,7 +1385,8 @@ function App() {
         </button>
         <div className="topbar-actions">
           <span className={summary?.indexing ? 'system-status is-busy' : 'system-status'}><i /> {summary?.indexing ? `인덱싱 ${progress}%` : 'INDEX READY'}</span>
-          {summary?.liveCount > 0 ? <span className="live-count">실행 중 {number.format(summary.liveCount)}</span> : null}
+          {summary?.liveCheckHealthy === false ? <span className="live-health is-error">라이브 확인 지연</span> : null}
+          {summary?.liveCount > 0 ? <span className="live-count">연결 {number.format(summary.liveCount)}</span> : null}
           <button className="refresh-button" type="button" onClick={refresh} disabled={loading} aria-busy={loading}>{loading ? '확인 중' : '다시 스캔'}</button>
         </div>
       </nav>
@@ -1316,13 +1453,13 @@ function App() {
                   aria-pressed={liveOnly}
                   onClick={() => setLiveOnly((value) => !value)}
                 >
-                  <span>실행 중</span><strong>{number.format(summary?.liveCount || 0)}</strong>
+                  <span>연결됨</span><strong>{number.format(summary?.liveCount || 0)}</strong>
                 </button>
               </div>
               <label>
                 <span>기간</span>
                 <span className="select-shell">
-                  <select value={period} onChange={(event) => setPeriod(event.target.value)}>
+                  <select name="period" value={period} onChange={(event) => setPeriod(event.target.value)}>
                     {PERIODS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   </select>
                 </span>
@@ -1331,11 +1468,11 @@ function App() {
                 <div className="date-range">
                   <label>
                     <span>시작</span>
-                    <input type="date" value={customFrom} max={customTo || undefined} onChange={(event) => setCustomFrom(event.target.value)} />
+                    <input name="period-from" type="date" value={customFrom} max={customTo || undefined} onChange={(event) => setCustomFrom(event.target.value)} />
                   </label>
                   <label>
                     <span>종료</span>
-                    <input type="date" value={customTo} min={customFrom || undefined} onChange={(event) => setCustomTo(event.target.value)} />
+                    <input name="period-to" type="date" value={customTo} min={customFrom || undefined} onChange={(event) => setCustomTo(event.target.value)} />
                   </label>
                 </div>
               ) : null}
@@ -1343,7 +1480,7 @@ function App() {
               <label>
                 <span>작업 폴더</span>
                 <span className="select-shell">
-                  <select value={folder} onChange={(event) => setFolder(event.target.value)}>
+                  <select name="folder" value={folder} onChange={(event) => setFolder(event.target.value)}>
                     <option value="">모든 작업 폴더</option>
                     {summary?.folders.map((item) => <option key={item.cwd} value={item.cwd}>{item.name} · {item.count}</option>)}
                   </select>
@@ -1351,13 +1488,36 @@ function App() {
               </label>
               {filtersActive ? <button className="filter-reset" type="button" onClick={resetFilters}>필터 초기화</button> : null}
             </section>
+            <details className="filter-block group-block" open>
+              <summary>그룹 <strong>{number.format(groups.length)}</strong></summary>
+              <div className="filter-block-body">
+                <div className="group-list" role="group" aria-label="세션 그룹">
+                  <button className="group-filter" type="button" aria-pressed={!group} onClick={() => setGroup('')}>
+                    <span>전체 세션</span>
+                  </button>
+                  {groups.map((item) => (
+                    <div className="group-item" key={item.id}>
+                      <button className="group-filter" type="button" aria-pressed={group === item.id} onClick={() => setGroup(item.id)}>
+                        <span>{item.name}</span><strong>{number.format(item.count || 0)}</strong>
+                      </button>
+                      <button className="group-delete" type="button" disabled={groupSubmitting} onClick={() => void deleteGroup(item)} aria-label={`${item.name} 그룹 삭제`}>×</button>
+                    </div>
+                  ))}
+                </div>
+                <form className="group-form" onSubmit={createGroup}>
+                  <label><span>새 그룹</span><input name="group-name" value={groupName} maxLength="60" onChange={(event) => setGroupName(event.target.value)} placeholder="예: 이번 주 우선순위" aria-invalid={Boolean(groupError)} /></label>
+                  <button type="submit" disabled={groupSubmitting || !groupName.trim()}>{groupSubmitting ? '저장 중' : '그룹 만들기'}</button>
+                </form>
+                {groupError ? <p className="group-error" role="alert">{groupError}</p> : null}
+              </div>
+            </details>
             {/* 저장소는 설정성 묶음이다. 접어두면 사이드바가 목록을 밀어내리지 않는다. */}
             <details className="filter-block">
               <summary>저장소</summary>
               <div className="filter-block-body">
                 <ul className="repository-list">{sessionDirectories.map((item) => <li key={item} title={item}>{item}</li>)}</ul>
                 <form className="directory-form" onSubmit={addDirectory}>
-                  <label><span>세션 경로 추가</span><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="~/work/gjc-sessions" aria-invalid={Boolean(directoryError)} aria-describedby="directory-message" /></label>
+                  <label><span>세션 경로 추가</span><input name="session-directory" value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="~/work/gjc-sessions" aria-invalid={Boolean(directoryError)} aria-describedby="directory-message" /></label>
                   <button type="submit" disabled={addingDirectory || !directory.trim()}>{addingDirectory ? '경로 확인 중' : '경로 추가'}</button>
                   <p id="directory-message" className={directoryError ? 'is-error' : undefined} role={directoryError ? 'alert' : undefined}>{directoryError || 'JSONL 세션이 저장된 폴더를 입력하세요.'}</p>
                 </form>
@@ -1370,14 +1530,23 @@ function App() {
               <div role="status"><strong>{number.format(resultCount)}</strong><span>개 세션</span></div>
               <div className="results-tools">
                 <button className="select-toggle" type="button" aria-pressed={selectMode} onClick={() => { setSelectMode((value) => !value); setSelectedIds(new Set()); }}>{selectMode ? '선택 끝내기' : '선택'}</button>
-                <label>정렬 <span className="select-shell"><select value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">최근 활동순</option><option value="tokens">토큰 많은순</option><option value="cost">비용 높은순</option></select></span></label>
+                <label>정렬 <span className="select-shell"><select name="sort" value={sort} onChange={(event) => setSort(event.target.value)}><option value="recent">최근 활동순</option><option value="tokens">토큰 많은순</option><option value="cost">비용 높은순</option></select></span></label>
               </div>
             </header>
             {undo ? <div className="undo-bar" role="status"><p>{number.format(undo.sessions.length)}개 세션을 보관했습니다</p><button ref={undoRef} type="button" onClick={() => void undoArchive()} disabled={undoSubmitting}>{undoSubmitting ? '되돌리는 중' : '되돌리기'}</button></div> : null}
             {selectMode ? (
               <div className="bulk-bar">
-                <label><input type="checkbox" disabled={bulkSubmitting} checked={sessions.length > 0 && selectedIds.size === sessions.length} onChange={() => setSelectedIds(selectedIds.size === sessions.length ? new Set() : new Set(sessions.map((session) => session.id)))} /> 불러온 행 모두 선택</label>
+                <label><input name="select-all-sessions" type="checkbox" disabled={bulkSubmitting} checked={sessions.length > 0 && selectedIds.size === sessions.length} onChange={() => setSelectedIds(selectedIds.size === sessions.length ? new Set() : new Set(sessions.map((session) => session.id)))} /> 불러온 행 모두 선택</label>
                 <p>{selectedIds.size ? `${number.format(selectedIds.size)}개 선택됨` : '선택된 세션 없음'}</p>
+                <label className="bulk-group">
+                  <span className="sr-only">대상 그룹</span>
+                  <select name="target-group" value={groupTarget} disabled={bulkSubmitting || groups.length === 0} onChange={(event) => setGroupTarget(event.target.value)}>
+                    <option value="">그룹 선택</option>
+                    {groups.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                  </select>
+                </label>
+                <button type="button" disabled={bulkSubmitting || !selectedIds.size || !groupTarget} onClick={() => void updateGroupMembership(true)}>그룹에 추가</button>
+                <button type="button" disabled={bulkSubmitting || !selectedIds.size || !groupTarget} onClick={() => void updateGroupMembership(false)}>그룹에서 제외</button>
                 <button type="button" disabled={bulkSubmitting || !selectedIds.size} onClick={() => void archiveSelected()}>{bulkSubmitting ? '보관 중' : '선택 보관'}</button>
               </div>
             ) : null}
@@ -1401,12 +1570,12 @@ function App() {
         </div>
       </main>
 
-      <footer className="page-footer"><span>LOCAL ONLY</span><span>{sessionDirectories.length}개 저장소</span><span>{summary?.scannedAt ? `마지막 확인 ${formatRelative(summary.scannedAt)}` : '저장소 확인 중'}</span></footer>
+      <footer className="page-footer"><span>LOCAL ONLY</span><span>{sessionDirectories.length}개 저장소</span><span>{summary?.liveCheckedAt ? `라이브 확인 ${formatRelative(summary.liveCheckedAt)}` : '라이브 확인 중'}</span><span>{summary?.scannedAt ? `파일 스캔 ${formatRelative(summary.scannedAt)}` : '저장소 확인 중'}</span></footer>
       </div>
 
       <CommandPalette open={paletteOpen} query={query} setQuery={setQuery} sessions={paletteSessions} activeIndex={paletteActiveIndex} setActiveIndex={setActiveIndex} onClose={closePalette} onSelect={openDetail} inputRef={paletteInputRef} />
       <SessionDetail selected={selected} detail={detail} loading={detailLoading} error={detailError} mutationDisabled={summary?.indexing} onClose={closeDetail} onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onArchive={archiveSession} />
-      {activeModel ? <ModelSessions key={activeModel.id} model={activeModel} from={modelRange.from} to={modelRange.to} revision={modelRevision} onClose={closeModelSessions} onSelect={openSessionFromModel} /> : null}
+      {activeModel ? <ModelSessions key={activeModel.id} model={activeModel} from={modelRange.from} to={modelRange.to} group={group} revision={modelRevision} onClose={closeModelSessions} onSelect={openSessionFromModel} /> : null}
     </div>
   );
 }
